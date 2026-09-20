@@ -12,6 +12,7 @@ from database.db_manager import (
 )
 from data_pipeline.financial_loader import parse_financial_ratio, parse_growth_and_cfo
 from data_pipeline.anti_blocking import safe_request
+from data_pipeline.rate_limiter import throttle
 
 # Tắt telemetry của vnstock để tăng tốc
 os.environ['VNSTOCK_TELEMETRY'] = 'off'
@@ -39,6 +40,7 @@ def fetch_all_listed_tickers(exchange: str = "HOSE") -> list:
         from vnstock import Listing
         listing = Listing(source='VCI')
 
+        throttle()
         try:
             # Ưu tiên lọc đúng sàn (mặc định HOSE, theo phạm vi Chiến lược số 1)
             df = listing.symbols_by_exchange()
@@ -77,6 +79,7 @@ def fetch_vn30_tickers() -> list:
     try:
         from vnstock import Listing
         listing = Listing(source='VCI')
+        throttle()
         result = listing.symbols_by_group(group='VN30')
 
         if hasattr(result, 'tolist'):
@@ -116,10 +119,12 @@ def fetch_stock_quote_history(ticker: str, days: int = 450) -> pd.DataFrame:
         
         try:
             from vnstock.api.quote import Quote
+            throttle()
             q = Quote(symbol=ticker, source='VCI')
             df = q.history(start=start_date, end=end_date)
         except (Exception, SystemExit, BaseException):
             from vnstock import Vnstock
+            throttle()
             stock = Vnstock().stock(symbol=ticker, source='VCI')
             df = stock.quote.history(start=start_date, end=end_date)
         
@@ -177,16 +182,19 @@ def fetch_stock_financials(ticker: str, force_update: bool = False) -> Dict[str,
         stock = Vnstock().stock(symbol=ticker, source='VCI')
         
         # 1. Lấy bảng tỷ số tài chính
+        throttle()
         df_ratio = stock.finance.ratio(period='quarter', lang='vi')
         parsed_ratio = parse_financial_ratio(df_ratio)
         
         # 2. Lấy bảng KQKD và Lưu chuyển tiền tệ
         try:
+            throttle()
             df_inc = stock.finance.income_statement(period='quarter', lang='vi')
         except Exception:
             df_inc = None
             
         try:
+            throttle()
             df_cf = stock.finance.cash_flow(period='quarter', lang='vi')
         except Exception:
             df_cf = None

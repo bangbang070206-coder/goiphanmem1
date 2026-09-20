@@ -77,4 +77,14 @@ CHASE_BUY_MAX_ATR = 0.5             # Nếu giá mở cửa > Close + 0.5*ATR th
 # 7. QUÉT ĐỊNH KỲ TOÀN THỊ TRƯỜNG (Background Scanner)
 # ==========================================
 SIGNALS_SCAN_INTERVAL_MINUTES = 30  # Khoảng cách giữa 2 lần quét định kỳ toàn thị trường
-SIGNALS_SCAN_DELAY_SECONDS = 0.3    # Nghỉ giữa mỗi mã trong lúc quét, tránh dồn dập gọi API
+SIGNALS_SCAN_DELAY_SECONDS = 0      # (không dùng nữa - xem VNSTOCK_MIN_INTERVAL_SECONDS bên dưới)
+
+# ==========================================
+# 8. GIỚI HẠN TỐC ĐỘ GỌI API VNSTOCK (Rate Limiting)
+# ==========================================
+# Gói Khách (Guest, chưa đăng ký) của vnstock giới hạn 20 request/phút -> tối
+# thiểu ~3.0s giữa 2 request để không bị "Rate limit exceeded".
+# Sau khi chạy register_user() để lấy API key miễn phí (gói Community, 60
+# request/phút), có thể giảm xuống còn ~1.05s.
+VNSTOCK_MIN_INTERVAL_SECONDS = 3.2
+API_CALL_TIMEOUT_SECONDS = 15       # Timeout cứng cho mỗi lệnh gọi vnstock - tránh treo vô thời hạn

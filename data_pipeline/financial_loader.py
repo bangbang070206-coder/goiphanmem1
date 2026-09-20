@@ -67,11 +67,23 @@ def parse_financial_ratio(df_ratio: pd.DataFrame) -> Dict[str, Any]:
 
     return res
 
-def _sum_last_n_quarters(df: pd.DataFrame, item_pattern: str, sorted_cols: list, n: int, offset: int = 0) -> Optional[float]:
+def _find_matching_row(df: pd.DataFrame, patterns: list):
+    """Thử lần lượt từng pattern theo thứ tự ƯU TIÊN, dùng pattern ĐẦU TIÊN có khớp.
+    Không gộp nhiều pattern vào 1 regex OR duy nhất, vì .iloc[0] khi đó sẽ lấy dòng
+    xuất hiện SỚM NHẤT trong bảng - có thể là dòng kém chính xác hơn (vd: lấy nhầm
+    'Lãi/(lỗ) thuần sau thuế' tổng thay vì 'Lợi nhuận của Cổ đông của Công ty mẹ'
+    đúng theo định nghĩa 'LNST công ty mẹ' của Chiến lược số 1)."""
+    for pat in patterns:
+        row = df[df['item'].astype(str).str.contains(pat, na=False, regex=True)]
+        if not row.empty:
+            return row.iloc[0]
+    return None
+
+def _sum_last_n_quarters(df: pd.DataFrame, patterns: list, sorted_cols: list, n: int, offset: int = 0) -> Optional[float]:
     """Cộng dồn giá trị của n quý, bỏ qua `offset` quý gần nhất (offset=0 -> n quý mới nhất,
     offset=4 -> 4 quý liền TRƯỚC đó, dùng để tính TTM kỳ trước cho việc so sánh tăng trưởng)."""
-    row = df[df['item'].astype(str).str.contains(item_pattern, na=False, regex=True)]
-    if row.empty:
+    row = _find_matching_row(df, patterns)
+    if row is None:
         return None
     end = len(sorted_cols) - offset
     start = end - n
@@ -79,7 +91,7 @@ def _sum_last_n_quarters(df: pd.DataFrame, item_pattern: str, sorted_cols: list,
         return None
     window = sorted_cols[start:end]
     try:
-        return sum(float(row.iloc[0][c]) for c in window)
+        return sum(float(row[c]) for c in window)
     except Exception:
         return None
 
@@ -105,43 +117,50 @@ def parse_growth_and_cfo(df_inc: pd.DataFrame, df_cf: pd.DataFrame) -> Dict[str,
         "eps": None,
     }
 
-    rev_pattern = 'Doanh thu thuần'
-    np_pattern = 'Lợi nhuận sau thuế của cổ đông|Lợi nhuận sau thuế'
-    cfo_pattern = r'Lưu chuyển tiền thuần từ hoạt động kinh doanh|Lợi nhuận/\(lỗ\) từ hoạt động kinh doanh'
+    # Tên dòng THẬT đã xác nhận từ dữ liệu vnstock trả về (không còn đoán):
+    # - vnstock dùng "Lãi/(lỗ)" thay vì "Lợi nhuận" cho dòng tổng, nhưng dòng
+    #   RIÊNG cho cổ đông công ty mẹ vẫn dùng chữ "Lợi nhuận".
+    # - Ưu tiên "Lợi nhuận của Cổ đông của Công ty mẹ" trước, vì đây đúng là
+    #   "LNST công ty mẹ" mà Chiến lược số 1 / config.py yêu cầu (loại trừ phần
+    #   lợi ích cổ đông thiểu số). Fallback "Lãi/(lỗ) thuần sau thuế" (tổng LNST)
+    #   chỉ dùng khi công ty không có dòng tách riêng cổ đông thiểu số.
+    rev_patterns = ['Doanh thu thuần']
+    np_patterns = [r'Lợi nhuận của Cổ đông của Công ty mẹ', r'Lãi/\(lỗ\) thuần sau thuế']
+    cfo_patterns = [r'Lưu chuyển tiền thuần từ hoạt động kinh doanh', r'Lợi nhuận/\(lỗ\) từ hoạt động kinh doanh']
 
     try:
         if df_inc is not None and not df_inc.empty:
             q_cols = _sort_quarter_columns([c for c in df_inc.columns if '-' in str(c) or 'Q' in str(c)])
 
             if len(q_cols) >= 8:
-                rev_now = _sum_last_n_quarters(df_inc, rev_pattern, q_cols, 4, offset=0)
-                rev_prev = _sum_last_n_quarters(df_inc, rev_pattern, q_cols, 4, offset=4)
+                rev_now = _sum_last_n_quarters(df_inc, rev_patterns, q_cols, 4, offset=0)
+                rev_prev = _sum_last_n_quarters(df_inc, rev_patterns, q_cols, 4, offset=4)
                 if rev_now is not None and rev_prev not in (None, 0):
                     res["rev_growth"] = (rev_now - rev_prev) / rev_prev
 
-                np_now = _sum_last_n_quarters(df_inc, np_pattern, q_cols, 4, offset=0)
-                np_prev = _sum_last_n_quarters(df_inc, np_pattern, q_cols, 4, offset=4)
+                np_now = _sum_last_n_quarters(df_inc, np_patterns, q_cols, 4, offset=0)
+                np_prev = _sum_last_n_quarters(df_inc, np_patterns, q_cols, 4, offset=4)
                 if np_now is not None and np_prev not in (None, 0):
                     res["np_growth"] = (np_now - np_prev) / np_prev
 
             elif len(q_cols) >= 5:
                 latest_col, yoy_col = q_cols[-1], q_cols[-5]
 
-                rev_row = df_inc[df_inc['item'].astype(str).str.contains(rev_pattern, na=False)]
-                if not rev_row.empty:
+                rev_row = _find_matching_row(df_inc, rev_patterns)
+                if rev_row is not None:
                     try:
-                        rev_now = float(rev_row.iloc[0][latest_col])
-                        rev_yoy = float(rev_row.iloc[0][yoy_col])
+                        rev_now = float(rev_row[latest_col])
+                        rev_yoy = float(rev_row[yoy_col])
                         if rev_yoy != 0:
                             res["rev_growth"] = (rev_now - rev_yoy) / rev_yoy
                     except Exception:
                         pass
 
-                np_row = df_inc[df_inc['item'].astype(str).str.contains(np_pattern, na=False)]
-                if not np_row.empty:
+                np_row = _find_matching_row(df_inc, np_patterns)
+                if np_row is not None:
                     try:
-                        np_now = float(np_row.iloc[0][latest_col])
-                        np_yoy = float(np_row.iloc[0][yoy_col])
+                        np_now = float(np_row[latest_col])
+                        np_yoy = float(np_row[yoy_col])
                         if np_yoy != 0:
                             res["np_growth"] = (np_now - np_yoy) / np_yoy
                     except Exception:
@@ -151,14 +170,14 @@ def parse_growth_and_cfo(df_inc: pd.DataFrame, df_cf: pd.DataFrame) -> Dict[str,
         if df_cf is not None and not df_cf.empty:
             q_cols_cf = _sort_quarter_columns([c for c in df_cf.columns if '-' in str(c) or 'Q' in str(c)])
             if len(q_cols_cf) >= 4:
-                cfo_ttm = _sum_last_n_quarters(df_cf, cfo_pattern, q_cols_cf, 4, offset=0)
+                cfo_ttm = _sum_last_n_quarters(df_cf, cfo_patterns, q_cols_cf, 4, offset=0)
                 if cfo_ttm is not None:
                     res["cfo"] = cfo_ttm
             elif q_cols_cf:
-                cfo_row = df_cf[df_cf['item'].astype(str).str.contains(cfo_pattern, na=False)]
-                if not cfo_row.empty:
+                cfo_row = _find_matching_row(df_cf, cfo_patterns)
+                if cfo_row is not None:
                     try:
-                        res["cfo"] = float(cfo_row.iloc[0][q_cols_cf[-1]])
+                        res["cfo"] = float(cfo_row[q_cols_cf[-1]])
                     except Exception:
                         pass
 

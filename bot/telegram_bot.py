@@ -54,7 +54,7 @@ async def do_start(message: Message):
 SIGNALS_PAGE_SIZE = 10
 VN30_PAGE_SIZE = 10
 
-def _render_results_page(results: list, page: int, page_size: int, title_found: str, title_empty: str, meta_note: str, page_prefix: str):
+def _render_results_page(results: list, page: int, page_size: int, title_found: str, title_empty: str, meta_note: str, page_prefix: str, suggest_vn30: bool = False):
     """Dựng nội dung + bàn phím phân trang cho một danh sách kết quả đã chấm điểm.
     Dùng chung cho /signals (quét toàn thị trường từ cache nền) và /vn30 (quét live)."""
     buy_candidates = [r for r in results if r['status'] == 'BUY_CANDIDATE']
@@ -74,14 +74,14 @@ def _render_results_page(results: list, page: int, page_size: int, title_found: 
     page_items = source_list[start:start + page_size]
 
     reply_text = header + f"<i>Trang {page + 1}/{total_pages}</i>\n\n"
-    keyboard = []
     for i, c in enumerate(page_items, start + 1):
         score = c.get('scoring', {}).get('ta_score', 'N/A')
         close = c.get('technical', {}).get('close', 'N/A')
         fin_status = "✅ BCTC Đạt" if c.get('fundamental', {}).get('is_passed') else "❌ BCTC Chưa đạt"
         reply_text += f"{i}. <b>{c['ticker']}</b> - Giá: {close} | Điểm TA: <b>{score}/100</b> ({fin_status})\n"
-        keyboard.append([InlineKeyboardButton(f"🔍 Xem chi tiết {c['ticker']}", callback_data=f"cmd_check_{c['ticker']}")])
+    reply_text += "\n<i>💡 Gõ /check &lt;MÃ&gt; để xem chi tiết + biểu đồ của mã bất kỳ trong danh sách.</i>"
 
+    keyboard = []
     nav_row = []
     if page > 0:
         nav_row.append(InlineKeyboardButton("◀️ Trước", callback_data=f"{page_prefix}{page - 1}"))
@@ -89,6 +89,8 @@ def _render_results_page(results: list, page: int, page_size: int, title_found: 
         nav_row.append(InlineKeyboardButton("Sau ▶️", callback_data=f"{page_prefix}{page + 1}"))
     if nav_row:
         keyboard.append(nav_row)
+    if suggest_vn30:
+        keyboard.append([InlineKeyboardButton("📈 Thử quét nhanh VN30 thay vào đó", callback_data="cmd_vn30")])
     keyboard.append([InlineKeyboardButton("🔙 Quay lại Menu Chính", callback_data="cmd_start")])
 
     return reply_text, InlineKeyboardMarkup(keyboard)
@@ -118,7 +120,8 @@ async def do_signals(message: Message, application, page: int = 0, edit_target: 
         title_found="🎯 <b>DANH SÁCH CỔ PHIẾU ĐẠT TÍN HIỆU MUA (QUÉT TOÀN THỊ TRƯỜNG)</b>",
         title_empty="🟡 <b>Hiện thị trường chưa có mã nào vượt ngưỡng MUA (TA_Score >= 75).</b>",
         meta_note=meta_note,
-        page_prefix="cmd_signals_p"
+        page_prefix="cmd_signals_p",
+        suggest_vn30=True
     )
 
     if edit_target:
@@ -127,30 +130,56 @@ async def do_signals(message: Message, application, page: int = 0, edit_target: 
         msg = await message.reply_html("🔎 <i>Đang tổng hợp kết quả từ lần quét gần nhất...</i>")
         await safe_edit_message(msg, reply_text, markup)
 
-def _scan_vn30_sync():
-    """Phần việc nặng của quét VN30 - chạy trong thread riêng để không treo bot."""
+async def _scan_vn30_async(progress_cb=None):
+    """Quét rổ VN30 SONG SONG (thay vì tuần tự từng mã) để trả lời nhanh hơn nhiều,
+    đồng thời không giữ event loop bị bận lâu (mỗi lệnh gọi API chạy trong thread riêng).
+    Gọi progress_cb(done, total) sau mỗi mã xử lý xong, để hiển thị tiến độ cho người dùng
+    thay vì để họ tưởng bot bị đứng (do throttle() giới hạn tốc độ gọi API)."""
     tickers = fetch_vn30_tickers()
+    sem = asyncio.Semaphore(5)  # Giới hạn 5 lệnh gọi API đồng thời, tránh dồn dập/bị chặn IP
+
+    async def _process(t):
+        async with sem:
+            try:
+                df = await asyncio.to_thread(fetch_stock_quote_history, t, 450)
+                if df is not None and not df.empty:
+                    return await asyncio.to_thread(evaluate_ticker, t, df)
+            except Exception as e:
+                logger.warning(f"[VN30] Lỗi khi xử lý mã {t}: {e}")
+            return None
+
+    tasks = [asyncio.create_task(_process(t)) for t in tickers]
     results = []
-    for t in tickers:
-        try:
-            df = fetch_stock_quote_history(t, days=450)
-            if df is not None and not df.empty:
-                results.append(evaluate_ticker(t, df))
-        except Exception as e:
-            logger.warning(f"[VN30] Lỗi khi xử lý mã {t}: {e}")
+    done_count = 0
+    for coro in asyncio.as_completed(tasks):
+        r = await coro
+        done_count += 1
+        if r is not None:
+            results.append(r)
+        if progress_cb:
+            await progress_cb(done_count, len(tickers))
     return results, len(tickers)
 
 async def do_vn30(message: Message, page: int = 0, edit_target: Message = None):
     """Quét TRỰC TIẾP (live) rổ VN30 - lấy danh sách 30 mã qua API vnstock.Listing
-    ngay lúc bấm, không cần chờ job quét nền như /signals (toàn thị trường)."""
-    loading_text = "⏳ <i>Đang quét nhanh rổ VN30 (gọi API trực tiếp, chỉ 30 mã nên sẽ nhanh hơn)...</i>"
+    ngay lúc bấm, chạy song song nên không cần chờ job nền như /signals (toàn thị trường)."""
+    loading_text = "⏳ <i>Đang quét nhanh rổ VN30 - đã xử lý 0 mã...</i>"
     if edit_target:
         await safe_edit_message(edit_target, loading_text)
         target = edit_target
     else:
         target = await message.reply_html(loading_text)
 
-    results, total = await asyncio.to_thread(_scan_vn30_sync)
+    async def _progress(done, total):
+        # Chỉ cập nhật mỗi 5 mã (hoặc khi xong) để tránh gọi edit_message quá dày,
+        # bản thân việc gọi API Telegram edit_message cũng có giới hạn tốc độ riêng.
+        if done % 5 == 0 or done == total:
+            try:
+                await safe_edit_message(target, f"⏳ <i>Đang quét nhanh rổ VN30 - đã xử lý {done}/{total} mã...</i>")
+            except Exception:
+                pass
+
+    results, total = await _scan_vn30_async(progress_cb=_progress)
 
     if not results:
         await safe_edit_message(target, "⚠️ <i>Không lấy được dữ liệu cho rổ VN30. Vui lòng thử lại sau ít phút.</i>")
@@ -398,7 +427,13 @@ def build_application():
         write_timeout=30.0,
         pool_timeout=30.0
     )
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).request(request).build()
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .request(request)
+        .concurrent_updates(True)  # Cho phép xử lý nhiều update song song - tránh "đứng khung chat"
+        .build()                   # khi có 1 tác vụ chạy lâu (vd: quét VN30, quét nền toàn thị trường)
+    )
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("signals", signals_command))

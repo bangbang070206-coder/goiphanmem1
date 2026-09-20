@@ -1,10 +1,9 @@
 import json
 import logging
-import time
 from datetime import datetime, timezone
 from telegram.ext import ContextTypes
 
-from config import DB_DIR, SIGNALS_SCAN_DELAY_SECONDS
+from config import DB_DIR
 from data_pipeline.fetcher import fetch_all_listed_tickers, fetch_stock_quote_history
 from core_logic.strategy import evaluate_ticker
 
@@ -56,9 +55,6 @@ def _scan_market_sync() -> dict:
 
         if i % 50 == 0:
             logger.info(f"[Scanner] Đã xử lý {i}/{len(tickers)} mã...")
-
-        # Nghỉ nhẹ giữa các mã để không dồn dập gọi API (đa số lần sau sẽ ăn cache SQLite nên rất nhanh)
-        time.sleep(SIGNALS_SCAN_DELAY_SECONDS)
 
     payload = {
         "timestamp": datetime.now(timezone.utc).isoformat(),

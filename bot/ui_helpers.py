@@ -6,7 +6,6 @@ def get_main_menu_keyboard() -> InlineKeyboardMarkup:
     """Bàn phím tương tác nhanh ở màn hình chính"""
     keyboard = [
         [
-            InlineKeyboardButton("🎯 Tín hiệu toàn thị trường", callback_data="cmd_signals"),
             InlineKeyboardButton("📈 Quét nhanh VN30", callback_data="cmd_vn30")
         ],
         [
