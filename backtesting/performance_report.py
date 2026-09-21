@@ -2,7 +2,7 @@ from typing import List, Dict, Any
 from backtesting.backtest_engine import run_backtest_single_stock
 from data_pipeline.fetcher import fetch_stock_quote_history, fetch_stock_financials
 from core_logic.fundamental_filter import check_fundamental_criteria
-from config import DEFAULT_WATCHLIST
+from config import DEFAULT_WATCHLIST, PERCENTILE_WINDOW
 
 def run_portfolio_backtest(tickers: List[str] = None, lookback_days: int = 150) -> Dict[str, Any]:
     """
@@ -12,12 +12,22 @@ def run_portfolio_backtest(tickers: List[str] = None, lookback_days: int = 150) 
     """
     if tickers is None:
         tickers = ["HPG", "FPT", "VNM", "MWG", "REE"]
-        
+
+    # backtest_engine.run_backtest_single_stock() cần tối thiểu:
+    # PERCENTILE_WINDOW (252 phiên tính phân vị) + 50 phiên khởi động chỉ báo (EMA50...)
+    # + lookback_days (số phiên thực sự đem backtest) = tổng số PHIÊN GIAO DỊCH cần có.
+    # Nhưng fetch_stock_quote_history nhận tham số 'days' là NGÀY LỊCH (bao gồm cả
+    # cuối tuần/lễ) - 1 năm chỉ có ~250 phiên giao dịch trên 365 ngày lịch, nên phải
+    # nhân hệ số quy đổi (~1.6x có thêm biên an toàn), nếu không sẽ thiếu dữ liệu và
+    # vòng lặp backtest gần như không chạy được (dẫn tới hầu như không có tín hiệu nào).
+    required_sessions = PERCENTILE_WINDOW + 50 + lookback_days
+    fetch_days = int(required_sessions * 1.6)
+
     all_trades = []
     stock_summaries = {}
     
     for t in tickers:
-        df = fetch_stock_quote_history(t, days=lookback_days + 300)
+        df = fetch_stock_quote_history(t, days=fetch_days)
         res = run_backtest_single_stock(
             ticker=t, 
             df=df, 

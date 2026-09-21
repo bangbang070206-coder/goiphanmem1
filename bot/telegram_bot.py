@@ -8,9 +8,9 @@ from telegram.ext import (
 )
 from telegram.request import HTTPXRequest
 
-from config import TELEGRAM_BOT_TOKEN, DEFAULT_NAV, SIGNALS_SCAN_INTERVAL_MINUTES
-from data_pipeline.fetcher import fetch_stock_quote_history, fetch_stock_financials, fetch_vn30_tickers
-from core_logic.scanner import run_full_market_scan, get_latest_scan
+from config import TELEGRAM_BOT_TOKEN, DEFAULT_NAV
+from data_pipeline.fetcher import fetch_stock_quote_history, fetch_stock_financials, fetch_vn30_tickers, fetch_all_listed_tickers
+from core_logic.scanner import get_latest_scan, save_scan_result, is_scan_fresh
 from core_logic.strategy import evaluate_ticker
 from risk_management.position_sizing import calculate_position_size
 from backtesting.performance_report import run_portfolio_backtest, format_backtest_message
@@ -53,10 +53,11 @@ async def do_start(message: Message):
 
 SIGNALS_PAGE_SIZE = 10
 VN30_PAGE_SIZE = 10
+SIGNALS_FRESHNESS_MINUTES = 20
 
 def _render_results_page(results: list, page: int, page_size: int, title_found: str, title_empty: str, meta_note: str, page_prefix: str, suggest_vn30: bool = False):
     """Dựng nội dung + bàn phím phân trang cho một danh sách kết quả đã chấm điểm.
-    Dùng chung cho /signals (quét toàn thị trường từ cache nền) và /vn30 (quét live)."""
+    Dùng chung cho /signals (quét toàn thị trường) và /vn30 (quét live)."""
     buy_candidates = [r for r in results if r['status'] == 'BUY_CANDIDATE']
     buy_candidates.sort(key=lambda x: x.get('scoring', {}).get('ta_score', 0) or 0, reverse=True)
 
@@ -95,21 +96,60 @@ def _render_results_page(results: list, page: int, page_size: int, title_found: 
 
     return reply_text, InlineKeyboardMarkup(keyboard)
 
-async def do_signals(message: Message, application, page: int = 0, edit_target: Message = None):
-    scan = get_latest_scan(application)
-    results = scan.get("results") if scan else None
+async def _scan_market_async(progress_cb=None):
+    """Quét TOÀN THỊ TRƯỜNG theo yêu cầu (live, không còn job nền tự động) - cùng cách
+    làm với VN30: song song có giới hạn, báo tiến độ để người dùng biết vẫn đang chạy."""
+    tickers = fetch_all_listed_tickers(exchange="HOSE")
+    sem = asyncio.Semaphore(5)
 
-    if not results:
-        text = (
-            "⏳ <i>Hệ thống đang quét toàn bộ thị trường lần đầu (chạy nền), việc này có thể mất vài phút "
-            "tùy số lượng mã. Vui lòng thử lại /signals sau ít phút, hoặc bấm 'Quét nhanh VN30' để xem ngay "
-            "kết quả của 30 mã vốn hóa lớn nhất trong lúc chờ.</i>"
-        )
+    async def _process(t):
+        async with sem:
+            try:
+                df = await asyncio.to_thread(fetch_stock_quote_history, t, 450)
+                if df is not None and not df.empty:
+                    return await asyncio.to_thread(evaluate_ticker, t, df)
+            except Exception as e:
+                logger.warning(f"[Signals] Lỗi khi xử lý mã {t}: {e}")
+            return None
+
+    tasks = [asyncio.create_task(_process(t)) for t in tickers]
+    results = []
+    done_count = 0
+    for coro in asyncio.as_completed(tasks):
+        r = await coro
+        done_count += 1
+        if r is not None:
+            results.append(r)
+        if progress_cb:
+            await progress_cb(done_count, len(tickers))
+    return results, len(tickers)
+
+async def do_signals(message: Message, application, page: int = 0, edit_target: Message = None):
+    fresh = is_scan_fresh(application, max_age_minutes=SIGNALS_FRESHNESS_MINUTES)
+
+    if not fresh:
+        # Cache đã cũ hoặc chưa từng quét -> quét live ngay bây giờ (giống /vn30),
+        # có báo tiến độ vì có thể mất một lúc tùy hạn mức API hiện có.
+        loading_text = "⏳ <i>Chưa có dữ liệu mới - đang quét toàn thị trường ngay bây giờ (đã xử lý 0 mã)...</i>"
         if edit_target:
-            await safe_edit_message(edit_target, text)
+            await safe_edit_message(edit_target, loading_text)
+            target = edit_target
         else:
-            await message.reply_html(text)
-        return
+            target = await message.reply_html(loading_text)
+
+        async def _progress(done, total):
+            if done % 5 == 0 or done == total:
+                try:
+                    await safe_edit_message(target, f"⏳ <i>Đang quét toàn thị trường - đã xử lý {done}/{total} mã...</i>")
+                except Exception:
+                    pass
+
+        results, total_listed = await _scan_market_async(progress_cb=_progress)
+        scan = save_scan_result(application, results, total_listed)
+        edit_target = target  # dùng luôn tin nhắn "đang quét..." để hiển thị kết quả cuối, khỏi gửi thêm tin nhắn mới
+    else:
+        scan = get_latest_scan(application)
+        results = scan.get("results")
 
     scanned_at = scan.get("timestamp", "")
     total_listed = scan.get("total_listed", len(results))
@@ -117,7 +157,7 @@ async def do_signals(message: Message, application, page: int = 0, edit_target: 
 
     reply_text, markup = _render_results_page(
         results, page, SIGNALS_PAGE_SIZE,
-        title_found="🎯 <b>DANH SÁCH CỔ PHIẾU ĐẠT TÍN HIỆU MUA (QUÉT TOÀN THỊ TRƯỜNG)</b>",
+        title_found="🎯 <b>DANH SÁCH CỔ PHIẾU ĐẠT TÍN HIỆU MUA</b>",
         title_empty="🟡 <b>Hiện thị trường chưa có mã nào vượt ngưỡng MUA (TA_Score >= 75).</b>",
         meta_note=meta_note,
         page_prefix="cmd_signals_p",
@@ -127,7 +167,7 @@ async def do_signals(message: Message, application, page: int = 0, edit_target: 
     if edit_target:
         await safe_edit_message(edit_target, reply_text, markup)
     else:
-        msg = await message.reply_html("🔎 <i>Đang tổng hợp kết quả từ lần quét gần nhất...</i>")
+        msg = await message.reply_html("🔎 <i>Đang tổng hợp kết quả...</i>")
         await safe_edit_message(msg, reply_text, markup)
 
 async def _scan_vn30_async(progress_cb=None):
@@ -316,7 +356,7 @@ async def do_portfolio(message: Message):
     await message.reply_html(msg, reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def do_backtest(message: Message):
-    msg = await message.reply_html("⏳ <i>Đang chạy kiểm thử Backtesting trên 8 mã cổ phiếu tiêu biểu... Vui lòng đợi trong giây lát...</i>")
+    msg = await message.reply_html("⏳ <i>Đang chạy kiểm thử Backtesting trên 5 mã cổ phiếu tiêu biểu (HPG, FPT, VNM, MWG, REE)... Có thể mất khoảng 20-30 giây do cần tải đủ lịch sử giá dài hạn...</i>")
 
     report = run_portfolio_backtest(lookback_days=120)
     reply_text = format_backtest_message(report)
@@ -446,20 +486,9 @@ def build_application():
     app.add_handler(CallbackQueryHandler(button_callback_handler))
     app.add_error_handler(error_handler)
 
-    # Đăng ký job quét toàn thị trường định kỳ (chạy nền, không chặn bot trả lời tin nhắn)
-    if app.job_queue is not None:
-        app.job_queue.run_repeating(
-            run_full_market_scan,
-            interval=SIGNALS_SCAN_INTERVAL_MINUTES * 60,
-            first=5,  # Chờ 5s sau khi bot khởi động rồi bắt đầu quét lần đầu
-            name="full_market_scan"
-        )
-        logger.info(f"Đã đăng ký quét toàn thị trường định kỳ mỗi {SIGNALS_SCAN_INTERVAL_MINUTES} phút.")
-    else:
-        logger.warning(
-            "JobQueue chưa khả dụng! Cài đặt bằng lệnh: "
-            "pip install \"python-telegram-bot[job-queue]\" để bật tính năng quét định kỳ. "
-            "/signals sẽ không có dữ liệu cho tới khi bạn cài đặt và khởi động lại bot."
-        )
+    # LƯU Ý: KHÔNG còn đăng ký job quét nền tự động (run_full_market_scan) nữa.
+    # /signals giờ quét THEO YÊU CẦU (xem do_signals) khi cache quá 20 phút, để tránh
+    # giành hạn mức API (throttle() dùng chung 1 cổng) với /check và /vn30 mọi lúc.
+    # Hàm run_full_market_scan trong core_logic/scanner.py vẫn còn đó nếu muốn bật lại thủ công.
 
     return app

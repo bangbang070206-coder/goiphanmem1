@@ -67,15 +67,44 @@ def _scan_market_sync() -> dict:
 
 
 async def run_full_market_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Callback cho JobQueue. Chạy phần việc nặng trong thread riêng để không
-    chặn vòng lặp async của bot (bot vẫn phản hồi tin nhắn khác trong lúc quét)."""
+    """Callback cho JobQueue (hiện KHÔNG được đăng ký tự động chạy nền nữa - xem
+    build_application() trong telegram_bot.py - để tránh giành hạn mức API với
+    /check và /vn30. Vẫn giữ hàm này để có thể bật lại thủ công nếu cần)."""
     import asyncio
     try:
         payload = await asyncio.to_thread(_scan_market_sync)
-        context.application.bot_data["last_scan"] = payload
-        _save_cache_to_disk(payload)
+        save_scan_result(context.application, payload["results"], payload["total_listed"])
     except Exception as e:
         logger.error(f"[Scanner] Job quét định kỳ thất bại: {e}")
+
+
+def save_scan_result(application, results: list, total_listed: int) -> dict:
+    """Lưu kết quả quét (dù đến từ job nền hay quét live theo yêu cầu /signals) vào
+    bot_data + file cache - dùng chung 1 hàm để mọi nguồn quét đều cập nhật cùng 1 nơi
+    mà /signals và /filterstats cùng đọc."""
+    payload = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "total_listed": total_listed,
+        "total_scanned": len(results),
+        "results": results,
+    }
+    application.bot_data["last_scan"] = payload
+    _save_cache_to_disk(payload)
+    return payload
+
+
+def is_scan_fresh(application, max_age_minutes: int = 20) -> bool:
+    """True nếu kết quả quét gần nhất còn 'mới' (dưới max_age_minutes) - dùng để quyết
+    định /signals có thể trả lời ngay từ cache hay phải quét live lại từ đầu."""
+    scan = get_latest_scan(application)
+    if not scan or not scan.get("results") or not scan.get("timestamp"):
+        return False
+    try:
+        ts = datetime.fromisoformat(scan["timestamp"])
+        age_minutes = (datetime.now(timezone.utc) - ts).total_seconds() / 60
+        return age_minutes < max_age_minutes
+    except Exception:
+        return False
 
 
 def get_latest_scan(application) -> dict:

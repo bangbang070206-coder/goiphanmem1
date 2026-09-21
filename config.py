@@ -74,6 +74,25 @@ TARGET_ATR_MULTIPLE = 3.0           # Target0 = Entry + 3 * ATR
 CHASE_BUY_MAX_ATR = 0.5             # Nếu giá mở cửa > Close + 0.5*ATR thì bỏ lệnh
 
 # ==========================================
+# 7. LOẠI TRỪ NHÓM NGÀNH TÀI CHÍNH (theo Mục 2 của Chiến lược số 1)
+# ==========================================
+# Ngân hàng/Chứng khoán/Bảo hiểm có cấu trúc vốn đặc thù (vd: "nợ" của ngân hàng
+# gồm cả tiền gửi khách hàng) khiến chỉ số Nợ/VCSH <= 1.5 không phản ánh đúng sức
+# khỏe thật - luôn "trượt" một cách máy móc dù công ty có thể rất tốt. Danh sách
+# này liệt kê thủ công các mã thuộc 3 nhóm ngành trên (không đầy đủ 100% nhưng phủ
+# các mã lớn/thường gặp trên HOSE) để loại khỏi bộ lọc BCTC, thay vì chấm sai.
+EXCLUDED_SECTOR_TICKERS = {
+    # Ngân hàng
+    "VCB", "BID", "CTG", "TCB", "MBB", "ACB", "VPB", "STB", "HDB", "VIB",
+    "TPB", "SHB", "EIB", "LPB", "OCB", "MSB", "SSB", "ABB", "BVB", "NAB",
+    "SGB", "KLB", "VBB", "PGB",
+    # Chứng khoán
+    "SSI", "VND", "VCI", "HCM", "MBS", "VIX", "FTS", "BSI", "CTS", "AGR", "ORS", "VDS",
+    # Bảo hiểm
+    "BVH", "BMI", "PVI", "PGI", "MIG", "BIC",
+}
+
+# ==========================================
 # 7. QUÉT ĐỊNH KỲ TOÀN THỊ TRƯỜNG (Background Scanner)
 # ==========================================
 SIGNALS_SCAN_INTERVAL_MINUTES = 30  # Khoảng cách giữa 2 lần quét định kỳ toàn thị trường

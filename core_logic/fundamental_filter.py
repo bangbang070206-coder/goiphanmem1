@@ -2,7 +2,7 @@ from typing import Dict, Any, Optional
 from config import (
     ROE_MIN, MAX_DEBT_TO_EQUITY, 
     REVENUE_GROWTH_MIN, NET_PROFIT_GROWTH_MIN, 
-    CFO_MIN, MAX_STALE_DAYS
+    CFO_MIN, MAX_STALE_DAYS, EXCLUDED_SECTOR_TICKERS
 )
 from datetime import datetime
 
@@ -28,6 +28,19 @@ def check_fundamental_criteria(metrics: Dict[str, Any]) -> Dict[str, Any]:
             "is_passed": False,
             "status": "DATA_UNAVAILABLE",
             "reason": "Chưa có dữ liệu BCTC (gọi API thất bại)",
+            "details": {}
+        }
+
+    ticker = str(metrics.get('ticker', '')).upper()
+    if ticker in EXCLUDED_SECTOR_TICKERS:
+        return {
+            "is_passed": False,
+            "status": "OUT_OF_SCOPE",
+            "reason": (
+                f"Mã {ticker} thuộc nhóm Ngân hàng/Chứng khoán/Bảo hiểm - nằm ngoài phạm vi "
+                f"bộ lọc BCTC này (Mục 2, Chiến lược số 1). Chỉ số Nợ/VCSH <= 1.5 không phản "
+                f"ánh đúng bản chất kinh doanh của nhóm ngành tài chính."
+            ),
             "details": {}
         }
 
