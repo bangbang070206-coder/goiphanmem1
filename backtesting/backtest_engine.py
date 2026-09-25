@@ -5,7 +5,7 @@ from core_logic.indicators import calculate_indicators
 from core_logic.scoring import calculate_percentile_rank
 from config import (
     PERCENTILE_WINDOW, TA_SCORE_BUY_THRESHOLD,
-    STOP_ATR_MULTIPLE, TARGET_ATR_MULTIPLE
+    STOP_ATR_MULTIPLE, TARGET_ATR_MULTIPLE, MIN_AVG_VALUE_20D
 )
 
 def run_backtest_single_stock(
@@ -20,7 +20,7 @@ def run_backtest_single_stock(
     - Tín hiệu phiên t -> Mua tại Open phiên t+1
     - Thoát vị thế khi chạm Stoploss, Target hoặc thủng EMA50
     """
-    if df is None or len(df) < PERCENTILE_WINDOW + 50:
+    if df is None or len(df) < 420:
         return {"ticker": ticker, "trades": [], "summary": {"total_trades": 0}}
         
     df_ind = calculate_indicators(df)
@@ -34,7 +34,7 @@ def run_backtest_single_stock(
     atr0 = 0.0
     is_partial = False
     
-    start_idx = max(PERCENTILE_WINDOW + 50, len(df_ind) - lookback_days)
+    start_idx = max(420, len(df_ind) - lookback_days)
     
     for i in range(start_idx, len(df_ind) - 1):
         # Kiểm tra phiên t (đóng cửa phiên hôm nay)
@@ -92,15 +92,21 @@ def run_backtest_single_stock(
             # Tính điểm phân vị tại phiên t
             curr_xt = curr_row['X_T']
             curr_xm = curr_row['X_M']
-            curr_xv = curr_row['X_V']
+            curr_vr = curr_row['vr']
+            curr_cp = curr_row['cp']
             
             hist_xt = df_ind['X_T'].iloc[i - PERCENTILE_WINDOW:i]
             hist_xm = df_ind['X_M'].iloc[i - PERCENTILE_WINDOW:i]
-            hist_xv = df_ind['X_V'].iloc[i - PERCENTILE_WINDOW:i]
+            hist_vr = df_ind['vr'].iloc[i - PERCENTILE_WINDOW:i]
             
             s_t = calculate_percentile_rank(curr_xt, hist_xt)
             s_m = calculate_percentile_rank(curr_xm, hist_xm)
-            s_v = calculate_percentile_rank(curr_xv, hist_xv)
+            percentile_vr = calculate_percentile_rank(curr_vr, hist_vr)
+            s_v = (
+                None
+                if percentile_vr is None or not np.isfinite(curr_cp)
+                else 0.5 * percentile_vr + 0.5 * (100.0 * curr_cp)
+            )
             
             if s_t is None or s_m is None or s_v is None:
                 continue
@@ -109,11 +115,18 @@ def run_backtest_single_stock(
             
             # Điều kiện mua bắt buộc
             cond_trend = (curr_row['close'] > curr_row['ema50']) and (curr_row['ema20'] > curr_row['ema50'])
+            cond_up_day = curr_row['close'] > df_ind['close'].iloc[i - 1]
+            cond_rsi = curr_row['rsi14'] > 50
             cond_price = (curr_row['cp'] > 0.5)
             cond_vol = (curr_row['vr'] > 1.0)
+            cond_distance = curr_row['atr14'] > 0 and abs(curr_row['close'] - curr_row['ema20']) / curr_row['atr14'] <= 3.0
+            traded_value = df_ind.get('traded_value_vnd')
+            if traded_value is None:
+                traded_value = df_ind['close'] * df_ind['volume']
+            cond_liquidity = traded_value.iloc[i - 20:i].mean() >= MIN_AVG_VALUE_20D
             cond_score = (ta_score >= TA_SCORE_BUY_THRESHOLD)
             
-            if cond_trend and cond_price and cond_vol and cond_score:
+            if all([cond_trend, cond_up_day, cond_rsi, cond_price, cond_vol, cond_distance, cond_liquidity, cond_score]):
                 # Mua tại Open của phiên t+1
                 entry_price = next_row['open']
                 atr0 = curr_row['atr14']

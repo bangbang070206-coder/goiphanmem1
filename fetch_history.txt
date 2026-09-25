@@ -1,0 +1,48 @@
+def fetch_stock_quote_history(ticker: str, days: int = 450) -> pd.DataFrame:
+    """
+    Thu thập dữ liệu nến lịch sử OHLCV:
+    - Ưu tiên 1: Đọc ngay từ SQLite cache cục bộ (phản hồi trong 0.002s, không tốn quota API)
+    - Ưu tiên 2: Nếu chưa có trong cache thì mới gọi API để lưu vào database
+    """
+    ticker = ticker.upper()
+    df_cached = get_price_history(ticker, limit=days)
+    
+    required_sessions = 420 if days >= 450 else 200
+
+    # Với chiến lược v2, 420 là số phiên tối thiểu; không dùng 200 nến cache
+    # rồi để core tự chặn sau khi đã mất thời gian quét.
+    if not df_cached.empty and len(df_cached) >= required_sessions:
+        return df_cached
+
+    # Gọi API vnstock để nạp dữ liệu lần đầu nếu DB chưa có
+    try:
+        end_date = datetime.now().strftime("%Y-%m-%d")
+        calendar_days = max(days, int(required_sessions * 1.6))
+        start_date = (datetime.now() - timedelta(days=calendar_days)).strftime("%Y-%m-%d")
+        
+        try:
+            from vnstock.api.quote import Quote
+            throttle()
+            q = Quote(symbol=ticker, source='VCI')
+            df = q.history(start=start_date, end=end_date)
+        except (Exception, SystemExit, BaseException):
+            from vnstock import Vnstock
+            throttle()
+            stock = Vnstock().stock(symbol=ticker, source='VCI')
+            df = stock.quote.history(start=start_date, end=end_date)
+        
+        if df is not None and not df.empty:
+            # Chuẩn hóa tên cột
+            df = df.rename(columns={
+                'time': 'date',
+                'Date': 'date'
+            })
+            if 'date' in df.columns:
+                df['date'] = df['date'].astype(str).str[:10]
+                save_price_history(ticker, df)
+                return get_price_history(ticker, limit=days)
+    except (Exception, SystemExit, BaseException) as e:
+        logger.warning(f"Lỗi khi gọi API vnstock cho {ticker}: {e}. Đang dùng dữ liệu cache...")
+        
+    # Trả về dữ liệu trong cache nếu API lỗi
+    return df_cached

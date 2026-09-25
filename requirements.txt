@@ -1,0 +1,6 @@
+numpy
+pandas
+python-dotenv
+python-telegram-bot
+vnstock3
+requests

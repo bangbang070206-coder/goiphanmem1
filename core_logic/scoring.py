@@ -1,91 +1,67 @@
-import numpy as np
 import pandas as pd
-from typing import Dict, Any, Optional
-from config import PERCENTILE_WINDOW, WEIGHT_TREND, WEIGHT_MOMENTUM, WEIGHT_VOLUME
+from typing import Dict, Any
 
-def calculate_percentile_rank(current_val: float, history_series: pd.Series) -> Optional[float]:
-    """
-    Tính điểm phân vị chuẩn hóa theo Mục 4 của Chiến lược số 1:
-    - So sánh giá trị phiên hiện tại với đúng 252 phiên liền trước của chính mã đó.
-    - Công thức: Score = (n_nhỏ_hơn + 0.5 * n_bằng) / N * 100
-    - Nếu không đủ 252 quan sát hợp lệ, trả về None (DATA_UNAVAILABLE).
-    """
-    valid_history = history_series.dropna()
-    if len(valid_history) < PERCENTILE_WINDOW:
+def _num(v):
+    try:
+        x = float(v)
+        return x if pd.notna(x) else None
+    except Exception:
         return None
-        
-    ref_window = valid_history.iloc[-PERCENTILE_WINDOW:]
-    n_total = len(ref_window)
-    
-    n_less = (ref_window < current_val).sum()
-    n_equal = (ref_window == current_val).sum()
-    
-    score = ((n_less + 0.5 * n_equal) / n_total) * 100.0
-    return float(np.clip(score, 0.0, 100.0))
 
 def score_stock(df_with_indicators: pd.DataFrame) -> Dict[str, Any]:
+    """Simple student-MVP technical score (max 65), no 252-session percentile."""
+    if df_with_indicators is None or df_with_indicators.empty:
+        return {"status": "DATA_UNAVAILABLE", "reason": "Không có dữ liệu giá", "ta_score": None}
+    if len(df_with_indicators) < 60:
+        return {"status": "DATA_UNAVAILABLE", "reason": f"Chưa đủ dữ liệu giá ({len(df_with_indicators)}/60 phiên)", "ta_score": None}
+
+    required = ["close", "ema20", "ema50", "rsi14", "atr14", "volume"]
+    missing = [c for c in required if c not in df_with_indicators.columns]
+    if missing:
+        return {"status": "DATA_UNAVAILABLE", "reason": f"Thiếu cột chỉ báo: {', '.join(missing)}", "ta_score": None}
+
+    last = df_with_indicators.iloc[-1]
+    prev = df_with_indicators.iloc[-2]
+    close, ema20, ema50, rsi14, atr14, volume = [_num(last[c]) for c in required]
+    prev_close = _num(prev["close"])
+    if any(v is None for v in [close, ema20, ema50, rsi14, atr14, volume, prev_close]):
+        return {"status": "DATA_UNAVAILABLE", "reason": "Thiếu giá trị chỉ báo ở phiên gần nhất", "ta_score": None}
+
+    avg_volume_20 = _num(df_with_indicators["volume"].iloc[-21:-1].mean()) if len(df_with_indicators) >= 21 else None
+    if avg_volume_20 is None or avg_volume_20 <= 0:
+        avg_volume_20 = _num(df_with_indicators["volume"].iloc[-20:].mean())
+    volume_ratio = volume / avg_volume_20 if avg_volume_20 and avg_volume_20 > 0 else None
+    distance_atr = abs(close - ema20) / atr14 if atr14 and atr14 > 0 else None
+    up_day = close > prev_close
+
+    trend = 20 if close > ema20 > ema50 else 0
+    rsi_score = 15 if rsi14 > 50 else 0
+    vol_score = 15 if volume_ratio is not None and volume_ratio >= 1.0 else 0
+    distance_score = 10 if distance_atr is not None and distance_atr <= 3.0 else 0
+    up_score = 5 if up_day else 0
+    technical_score = trend + rsi_score + vol_score + distance_score + up_score
+
+    date = str(last.get("date", ""))[:10]
+    raw = {"close": close, "ema20": ema20, "ema50": ema50, "atr14": atr14, "rsi14": rsi14,
+           "volume": volume, "avg_volume_20": avg_volume_20, "volume_ratio": volume_ratio,
+           "distance_atr": distance_atr, "up_day": up_day, "date": date}
+    return {"status": "SUCCESS", "technical_score": technical_score, "ta_score": technical_score,
+            "trend_score": trend, "momentum_score": rsi_score, "volume_score": vol_score, "raw": raw}
+def calculate_percentile_rank(series, window=252):
     """
-    Tính điểm cho phiên đóng cửa gần nhất:
-    - S_Trend (Xu hướng)
-    - S_Mom (Động lượng)
-    - S_Vol (Giá - Khối lượng)
-    - TA_Score = Trung bình 3 nhóm
+    Legacy compatibility helper for the existing backtest engine.
+    Returns the percentile rank of the latest value in the series.
     """
-    if df_with_indicators is None or len(df_with_indicators) < PERCENTILE_WINDOW + 50:
-        return {
-            "status": "DATA_UNAVAILABLE",
-            "reason": f"Chưa đủ dữ liệu lịch sử ({len(df_with_indicators) if df_with_indicators is not None else 0}/{PERCENTILE_WINDOW + 50} phiên)",
-            "trend_score": None,
-            "momentum_score": None,
-            "volume_score": None,
-            "ta_score": None
-        }
-        
-    last_idx = len(df_with_indicators) - 1
-    
-    # Lấy giá trị của phiên đóng cửa gần nhất (phiên t)
-    curr_xt = df_with_indicators['X_T'].iloc[last_idx]
-    curr_xm = df_with_indicators['X_M'].iloc[last_idx]
-    curr_xv = df_with_indicators['X_V'].iloc[last_idx]
-    
-    # 252 phiên liền trước (không chứa phiên t)
-    hist_xt = df_with_indicators['X_T'].iloc[:last_idx]
-    hist_xm = df_with_indicators['X_M'].iloc[:last_idx]
-    hist_xv = df_with_indicators['X_V'].iloc[:last_idx]
-    
-    s_trend = calculate_percentile_rank(curr_xt, hist_xt)
-    s_mom = calculate_percentile_rank(curr_xm, hist_xm)
-    s_vol = calculate_percentile_rank(curr_xv, hist_xv)
-    
-    if s_trend is None or s_mom is None or s_vol is None:
-        return {
-            "status": "DATA_UNAVAILABLE",
-            "reason": "Thiếu dữ liệu nến để chuẩn hóa 252 phiên",
-            "trend_score": s_trend,
-            "momentum_score": s_mom,
-            "volume_score": s_vol,
-            "ta_score": None
-        }
-        
-    ta_score = (WEIGHT_TREND * s_trend) + (WEIGHT_MOMENTUM * s_mom) + (WEIGHT_VOLUME * s_vol)
-    
-    return {
-        "status": "SUCCESS",
-        "trend_score": round(s_trend, 1),
-        "momentum_score": round(s_mom, 1),
-        "volume_score": round(s_vol, 1),
-        "ta_score": round(ta_score, 1),
-        "raw": {
-            "X_T": curr_xt,
-            "X_M": curr_xm,
-            "X_V": curr_xv,
-            "close": df_with_indicators['close'].iloc[last_idx],
-            "ema20": df_with_indicators['ema20'].iloc[last_idx],
-            "ema50": df_with_indicators['ema50'].iloc[last_idx],
-            "atr14": df_with_indicators['atr14'].iloc[last_idx],
-            "rsi14": df_with_indicators['rsi14'].iloc[last_idx],
-            "vr": df_with_indicators['vr'].iloc[last_idx],
-            "cp": df_with_indicators['cp'].iloc[last_idx],
-            "date": str(df_with_indicators['date'].iloc[last_idx])[:10]
-        }
-    }
+    import pandas as pd
+
+    s = pd.Series(series).dropna()
+
+    if s.empty:
+        return None
+
+    if window and len(s) > window:
+        s = s.iloc[-window:]
+
+    last_value = s.iloc[-1]
+
+    return float((s <= last_value).mean() * 100)

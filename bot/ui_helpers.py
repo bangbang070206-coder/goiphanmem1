@@ -1,108 +1,417 @@
 import html
-from typing import Dict, Any, List
+from typing import Dict, Any
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
+from core_logic.industry import list_industries
+
+
+# ============================================================
+# MENU CHÍNH
+# ============================================================
+
 def get_main_menu_keyboard() -> InlineKeyboardMarkup:
-    """Bàn phím tương tác nhanh ở màn hình chính"""
+    """
+    Menu chính của bot.
+
+    UX:
+    - Kiểm tra 1 mã
+    - Quét VN30
+    - Quét VN100
+    - Phân tích ngành
+    - Quản trị vốn
+    - Cảnh báo
+    - Backtest
+    """
+
     keyboard = [
         [
-            InlineKeyboardButton("📈 Quét nhanh VN30", callback_data="cmd_vn30")
+            InlineKeyboardButton(
+                "🔎 Kiểm tra mã",
+                callback_data="cmd_check_menu",
+            ),
         ],
         [
-            InlineKeyboardButton("💼 Quản trị vốn (/portfolio)", callback_data="cmd_portfolio"),
-            InlineKeyboardButton("📊 Kiểm định (/backtest)", callback_data="cmd_backtest")
+            InlineKeyboardButton(
+                "📊 Quét VN30",
+                callback_data="cmd_vn30",
+            ),
+            InlineKeyboardButton(
+                "📈 Quét VN100",
+                callback_data="cmd_vn100",
+            ),
         ],
         [
-            InlineKeyboardButton("🔔 Xem danh sách Cảnh báo", callback_data="cmd_my_alerts"),
-            InlineKeyboardButton("📉 Thống kê bộ lọc BCTC", callback_data="cmd_filterstats")
-        ]
+            InlineKeyboardButton(
+                "🏭 Phân tích ngành",
+                callback_data="cmd_industries",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "💼 Danh mục & vốn",
+                callback_data="cmd_portfolio",
+            ),
+            InlineKeyboardButton(
+                "🔔 Cảnh báo",
+                callback_data="cmd_my_alerts",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "📈 Backtest",
+                callback_data="cmd_backtest",
+            ),
+        ],
     ]
+
     return InlineKeyboardMarkup(keyboard)
+
+
+# ============================================================
+# MENU NHẬP MÃ
+# ============================================================
+
+def get_check_menu_keyboard() -> InlineKeyboardMarkup:
+    """
+    Menu hướng dẫn người dùng nhập mã cổ phiếu.
+    """
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "📊 Quét VN30",
+                callback_data="cmd_vn30",
+            ),
+            InlineKeyboardButton(
+                "📈 Quét VN100",
+                callback_data="cmd_vn100",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "🏭 Phân tích ngành",
+                callback_data="cmd_industries",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "🔙 Menu Chính",
+                callback_data="cmd_start",
+            ),
+        ],
+    ]
+
+    return InlineKeyboardMarkup(keyboard)
+
+
+# ============================================================
+# MENU NGÀNH
+# ============================================================
+
+def get_industry_keyboard() -> InlineKeyboardMarkup:
+    keyboard = []
+
+    industries = list_industries()
+
+    for index in range(0, len(industries), 2):
+        row = []
+
+        for item in industries[index:index + 2]:
+            row.append(
+                InlineKeyboardButton(
+                    item["name"],
+                    callback_data=f"cmd_industry_{item['code']}",
+                )
+            )
+
+        keyboard.append(row)
+
+    keyboard.append(
+        [
+            InlineKeyboardButton(
+                "🔙 Menu Chính",
+                callback_data="cmd_start",
+            )
+        ]
+    )
+
+    return InlineKeyboardMarkup(keyboard)
+
+
+# ============================================================
+# WELCOME
+# ============================================================
 
 def format_welcome_message() -> str:
     return (
-        "🤖 <b>CHÀO MỪNG BẠN ĐẾN VỚI FINTECH STOCK ALERT BOT!</b>\n\n"
-        "Hệ thống định lượng phân tích cổ phiếu Việt Nam tự động kết hợp:\n"
-        "• <b>Lọc BCTC:</b> ROE &gt;= 15%, Dòng tiền CFO &gt; 0, Nợ/VCSH &lt;= 1.5, Tăng trưởng TTM.\n"
-        "• <b>Chấm điểm Quant:</b> Phân vị 252 phiên Xu hướng - Động lượng - Giá &amp; Khối lượng.\n"
-        "• <b>Quản trị vốn:</b> Định cỡ lệnh theo Rủi ro 0.5% NAV &amp; Trailing Stop ATR.\n\n"
-        "<b>Các lệnh bạn có thể dùng:</b>\n"
-        "👉 <code>/signals</code> : Quét toàn thị trường (chạy nền định kỳ), lấy các mã đạt điểm MUA\n"
-        "👉 <code>/vn30</code> : Quét nhanh (live) 30 mã trong rổ VN30\n"
-        "👉 <code>/check &lt;MÃ&gt;</code> : Tra cứu chi tiết sức khỏe + biểu đồ kỹ thuật (Ví dụ: <code>/check HPG</code>)\n"
-        "👉 <code>/alert &lt;MÃ&gt;</code> : Đăng ký nhận thông báo tự động (Ví dụ: <code>/alert FPT</code>)\n"
-        "👉 <code>/portfolio</code> : Xem danh mục và quản lý vốn cá nhân\n"
-        "👉 <code>/backtest</code> : Xem kết quả kiểm thử chiến lược 6 tháng gần nhất\n"
-        "👉 <code>/filterstats</code> : Thống kê lý do các mã bị loại bởi bộ lọc BCTC\n\n"
-        "<i>Hãy bấm vào các nút bên dưới để trải nghiệm nhanh:</i>"
+        "🤖 <b>FINTECH STOCK ADVISOR BOT</b>\n\n"
+        "Trợ lý phân tích cổ phiếu Việt Nam với "
+        "bộ lọc BCTC, phân tích kỹ thuật và quản trị rủi ro.\n\n"
+
+        "📌 <b>Bot hiện tập trung vào:</b>\n"
+        "• 📊 Quét rổ <b>VN30</b>\n"
+        "• 📈 Quét rổ <b>VN100</b>\n"
+        "• 🔎 Kiểm tra chi tiết từng mã\n"
+        "• 🏭 Phân tích theo ngành\n"
+        "• 💼 Quản trị vốn &amp; vị thế\n"
+        "• 🔔 Theo dõi cảnh báo\n"
+        "• 📈 Kiểm định chiến lược\n\n"
+
+        "💡 <b>Cách dùng nhanh:</b>\n"
+        "1️⃣ Chọn <b>VN30</b> hoặc <b>VN100</b> để tìm ứng viên\n"
+        "2️⃣ Bấm <b>Kiểm tra</b> để xem chi tiết từng mã\n"
+        "3️⃣ Hoặc nhập trực tiếp <code>/check HPG</code>\n\n"
+
+        "⚠️ <i>Kết quả chỉ mang tính chất tham khảo, "
+        "không phải khuyến nghị đầu tư.</i>\n\n"
+
+        "<b>👇 Chọn chức năng bên dưới:</b>"
     )
 
-def format_check_result(res: Dict[str, Any], position_info: Dict[str, Any] = None) -> str:
-    ticker = res['ticker']
-    status = res['status']
-    tech = res.get('technical', {})
-    fin = res.get('fundamental', {})
-    scoring = res.get('scoring', {})
-    
-    # Biểu tượng trạng thái
-    status_icon = "🟢" if status == "BUY_CANDIDATE" else ("🟡" if status == "WATCHLIST" else "🔴")
-    status_text = "ỨNG VIÊN MUA (BUY_CANDIDATE)" if status == "BUY_CANDIDATE" else (
-        "THEO DÕI (WATCHLIST)" if status == "WATCHLIST" else f"LOẠI BỎ ({status})"
-    )
-    
-    msg = (
-        f"{status_icon} <b>KẾT QUẢ ĐÁNH GIÁ MÃ {ticker}</b>\n"
-        f"📅 <i>Ngày dữ liệu: {tech.get('date', 'Mới nhất')}</i>\n"
-        f"🏷 <b>Trạng thái:</b> <b>{status_text}</b>\n\n"
-    )
-    
-    # 1. Báo cáo tài chính
-    fin_passed = fin.get('is_passed', False)
-    fin_icon = "✅" if fin_passed else "❌"
-    details = fin.get('details', {})
-    msg += (
-        f"📋 <b>1. BỘ LỌC CƠ BẢN (BCTC):</b> {fin_icon}\n"
-        f"• ROE TTM: <code>{details.get('ROE', 'N/A')}</code> (Y/c &gt;= 15%)\n"
-        f"• Nợ/VCSH: <code>{details.get('Debt_to_Equity', 'N/A')}</code> (Y/c &lt;= 1.5)\n"
-        f"• Tăng trưởng DT: <code>{details.get('Rev_Growth', 'N/A')}</code> | LNST: <code>{details.get('NP_Growth', 'N/A')}</code>\n"
-        f"• Dòng tiền CFO: <code>{details.get('CFO', 'N/A')}</code>\n\n"
-    )
-    
-    # 2. Chấm điểm kỹ thuật 3 nhóm
-    ta_score = scoring.get('ta_score')
-    msg += (
-        "📊 <b>2. CHẤM ĐIỂM ĐỊNH LƯỢNG (PERCENTILE 252 PHIÊN):</b>\n"
-        f"• Điểm Xu hướng (Trend): <b>{scoring.get('trend_score', 'N/A')}/100</b>\n"
-        f"• Điểm Động lượng (RSI): <b>{scoring.get('momentum_score', 'N/A')}/100</b>\n"
-        f"• Điểm Giá &amp; Volume: <b>{scoring.get('volume_score', 'N/A')}/100</b>\n"
-        f"⭐️ <b>TỔNG ĐIỂM TA_SCORE:</b> <b>{ta_score if ta_score is not None else 'N/A'}/100</b> "
-        f"<i>(Ngưỡng mua: &gt;= 75)</i>\n\n"
-    )
-    
-    # 3. Kỹ thuật chi tiết
-    msg += (
-        "📈 <b>3. THÔNG SỐ KỸ THUẬT:</b>\n"
-        f"• Giá đóng cửa: <b>{tech.get('close', 'N/A')}</b>\n"
-        f"• EMA20: <code>{tech.get('ema20', 'N/A')}</code> | EMA50: <code>{tech.get('ema50', 'N/A')}</code>\n"
-        f"• RSI14: <code>{tech.get('rsi14', 'N/A')}</code> | ATR14: <code>{tech.get('atr14', 'N/A')}</code>\n"
-        f"• Khối lượng tương đối (VR): <code>{tech.get('vr', 'N/A')}x</code> (Y/c &gt; 1.0)\n\n"
-    )
-    
-    # 4. Quản trị rủi ro & Khuyến nghị
-    if status == "BUY_CANDIDATE" and position_info and position_info.get("can_buy"):
-        msg += (
-            "🎯 <b>4. KẾ HOẠCH VÀO LỆNH & QUẢN TRỊ VỐN:</b>\n"
-            f"• Giá mua tham chiếu (Entry): <b>{position_info['entry_price']}</b>\n"
-            f"• Cắt lỗ (Stop Loss - 2xATR): <b>{position_info['stop_loss']}</b>\n"
-            f"• Chốt lời (Target - 3xATR): <b>{position_info['target_price']}</b>\n"
-            f"• Khối lượng mua an toàn: <b>{position_info['quantity']} cổ phiếu</b>\n"
-            f"• Tổng giá trị: <b>{position_info['total_cost']:,.0f} VNĐ</b> ({position_info['pct_nav']:.1f}% NAV)\n"
-            f"• Rủi ro tối đa: <b>{position_info['risk_amount']:,.0f} VNĐ</b> (0.5% NAV)\n"
+
+# ============================================================
+# RESULT CHECK
+# ============================================================
+
+def format_check_result(
+    res: Dict[str, Any],
+    position_info: Dict[str, Any] = None,
+) -> str:
+
+    ticker = res["ticker"]
+    status = res["status"]
+
+    tech = res.get("technical", {})
+    fin = res.get("fundamental", {})
+    scoring = res.get("scoring", {})
+
+    # --------------------------------------------------------
+    # STATUS
+    # --------------------------------------------------------
+
+    status_icon = (
+        "🟢"
+        if status == "BUY_CANDIDATE"
+        else "🟡"
+        if status == "WATCHLIST"
+        else "⚪"
+        if status in (
+            "NOT_EVALUATED",
+            "DATA_INSUFFICIENT",
+            "DATA_UNAVAILABLE",
         )
+        else "🔴"
+    )
+
+    status_text = (
+        "ỨNG VIÊN MUA"
+        if status == "BUY_CANDIDATE"
+        else "THEO DÕI"
+        if status == "WATCHLIST"
+        else "CHƯA ĐÁNH GIÁ"
+        if status == "NOT_EVALUATED"
+        else "CHƯA ĐỦ DỮ LIỆU"
+        if status == "DATA_INSUFFICIENT"
+        else "CHƯA CÓ DỮ LIỆU"
+        if status == "DATA_UNAVAILABLE"
+        else f"LOẠI BỎ ({status})"
+    )
+
+    # --------------------------------------------------------
+    # HEADER
+    # --------------------------------------------------------
+
+    msg = (
+        f"{status_icon} <b>ĐÁNH GIÁ {ticker}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🧭 <b>Ngành:</b> "
+        f"{res.get('industry', {}).get('industry_name', 'Chưa xác định')}\n"
+        f"🧩 <b>Chiến lược:</b> "
+        f"{res.get('strategy_version', 'N/A')}\n"
+        f"📅 <b>Dữ liệu:</b> "
+        f"{tech.get('date', 'Mới nhất')}\n"
+        f"🏷 <b>Trạng thái:</b> "
+        f"{status_icon} <b>{status_text}</b>\n\n"
+    )
+
+    # --------------------------------------------------------
+    # 1. BCTC / FUNDAMENTAL
+    # --------------------------------------------------------
+
+    fin_passed = fin.get("is_passed", False)
+    fin_icon = "✅" if fin_passed else "❌"
+
+    details = fin.get("details", {})
+
+    msg += (
+        f"📋 <b>1. BỘ LỌC CƠ BẢN:</b> "
+        f"{fin_icon}\n"
+    )
+
+    groups = fin.get("groups") or details
+
+    if groups:
+        for group_name, checks in groups.items():
+
+            msg += (
+                f"<b>{html.escape(str(group_name))}</b>:\n"
+            )
+
+            for check in checks:
+
+                icon = (
+                    "✅"
+                    if check.get("status") == "PASS"
+                    else "❌"
+                    if check.get("status") == "FAIL"
+                    else "⚪"
+                )
+
+                value = html.escape(
+                    str(check.get("value", "N/A"))
+                )
+
+                threshold = check.get("threshold")
+
+                suffix = (
+                    f" | Y/C "
+                    f"{html.escape(str(threshold))}"
+                    if threshold is not None
+                    else ""
+                )
+
+                msg += (
+                    f"{icon} "
+                    f"{html.escape(str(check.get('label', check.get('code', 'metric'))))}: "
+                    f"<code>{value}</code>"
+                    f"{suffix}\n"
+                )
+
     else:
-        msg += "💡 <b>Khuyến nghị:</b>\n"
-        for r in res.get('reasons', []):
-            clean_r = html.escape(str(r))
-            msg += f"• <i>{clean_r}</i>\n"
-            
+        msg += "• Chưa có dữ liệu metric ngành.\n"
+
+    msg += (
+        f"⭐ <b>Điểm cơ bản:</b> "
+        f"{fin.get('score', 'N/A')}/"
+        f"{fin.get('max_score', 35)}\n\n"
+    )
+
+    # --------------------------------------------------------
+    # 2. CHẤM ĐIỂM KỸ THUẬT
+    # --------------------------------------------------------
+
+    ta_score = scoring.get("ta_score")
+
+    msg += (
+        "📊 <b>2. ĐIỂM KỸ THUẬT</b>\n"
+        f"• Xu hướng: "
+        f"<b>{scoring.get('trend_score', 'N/A')}</b>/100\n"
+        f"• Động lượng RSI: "
+        f"<b>{scoring.get('momentum_score', 'N/A')}</b>/100\n"
+        f"• Giá &amp; Volume: "
+        f"<b>{scoring.get('volume_score', 'N/A')}</b>/100\n"
+        f"⭐ <b>TA Score:</b> "
+        f"<b>{ta_score if ta_score is not None else 'N/A'}</b>/100\n\n"
+    )
+
+    # --------------------------------------------------------
+    # 3. THÔNG SỐ KỸ THUẬT
+    # --------------------------------------------------------
+
+    msg += (
+        "📈 <b>3. THÔNG SỐ KỸ THUẬT</b>\n"
+        f"• Giá đóng cửa: "
+        f"<b>{tech.get('close', 'N/A')}</b>\n"
+        f"• EMA20: "
+        f"<code>{tech.get('ema20', 'N/A')}</code> | "
+        f"EMA50: "
+        f"<code>{tech.get('ema50', 'N/A')}</code>\n"
+        f"• RSI14: "
+        f"<code>{tech.get('rsi14', 'N/A')}</code> | "
+        f"ATR14: "
+        f"<code>{tech.get('atr14', 'N/A')}</code>\n"
+        f"• Volume Ratio: "
+        f"<code>{tech.get('vr', 'N/A')}x</code>\n\n"
+    )
+
+    # --------------------------------------------------------
+    # 4. GATE / TÍN HIỆU
+    # --------------------------------------------------------
+
+    gates = res.get("gates", {})
+
+    if gates:
+
+        msg += "🧪 <b>4. KIỂM TRA TÍN HIỆU</b>\n"
+
+        for gate_name, gate in gates.items():
+
+            icon = (
+                "✅"
+                if gate.get("passed")
+                else "❌"
+            )
+
+            msg += (
+                f"{icon} <b>{html.escape(str(gate_name))}</b>: "
+                f"{html.escape(str(gate.get('observed', 'N/A')))}"
+            )
+
+            threshold = gate.get("threshold")
+
+            if threshold not in (None, ""):
+                msg += (
+                    f" | "
+                    f"{html.escape(str(threshold))}"
+                )
+
+            msg += "\n"
+
+        msg += "\n"
+
+    # --------------------------------------------------------
+    # 5. POSITION / REASON
+    # --------------------------------------------------------
+
+    if (
+        status == "BUY_CANDIDATE"
+        and position_info
+        and position_info.get("can_buy")
+    ):
+
+        msg += (
+            "🎯 <b>5. QUẢN TRỊ VỊ THẾ</b>\n"
+            f"• Entry: "
+            f"<b>{position_info['entry_price']}</b>\n"
+            f"• Stop Loss: "
+            f"<b>{position_info['stop_loss']}</b>\n"
+            f"• Target: "
+            f"<b>{position_info['target_price']}</b>\n"
+            f"• Khối lượng: "
+            f"<b>{position_info['quantity']} CP</b>\n"
+            f"• Giá trị: "
+            f"<b>{position_info['total_cost']:,.0f} VNĐ</b>\n"
+            f"• Tỷ trọng NAV: "
+            f"<b>{position_info['pct_nav']:.1f}%</b>\n"
+            f"• Rủi ro tối đa: "
+            f"<b>{position_info['risk_amount']:,.0f} VNĐ</b>\n"
+        )
+
+    else:
+
+        msg += "💡 <b>Nhận xét:</b>\n"
+
+        reasons = res.get("reasons", [])
+
+        if reasons:
+
+            for reason in reasons:
+                msg += (
+                    f"• <i>{html.escape(str(reason))}</i>\n"
+                )
+
+        else:
+            msg += "• Chưa có nhận xét bổ sung.\n"
+
     return msg

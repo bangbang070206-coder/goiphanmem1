@@ -60,11 +60,16 @@ py -m pip install python-telegram-bot vnstock3 pandas numpy requests
 ### Bước 2: Đăng ký Telegram Bot Token
 1. Mở ứng dụng Telegram, tìm kiếm `@BotFather`.
 2. Gõ `/newbot`, đặt tên hiển thị và username (kết thúc bằng chữ `bot`).
-3. Copy đoạn mã **HTTP API Token** (Ví dụ: `7123456789:AAFlkjhasdf87234_jhkasdf987234`).
-4. Mở file `config.py` và dán Token vào dòng:
-   ```python
-   TELEGRAM_BOT_TOKEN = "ĐIỀN_TOKEN_CỦA_BẠN_VÀO_ĐÂY"
+3. Copy đoạn mã **HTTP API Token**.
+4. Sao chép `.env.example` thành `.env`, rồi điền token:
+   ```text
+   TELEGRAM_BOT_TOKEN=token_cua_ban
    ```
+   Hoặc đặt tạm trong PowerShell trước khi chạy:
+   ```powershell
+   $env:TELEGRAM_BOT_TOKEN = "token_cua_ban"
+   ```
+   Không dán token vào `config.py` và không commit file `.env`.
 
 ### Bước 3: Chạy Bot
 - **Chế độ kiểm thử nhanh tại Terminal (Không cần Bot Token):**
@@ -88,6 +93,10 @@ py -m pip install python-telegram-bot vnstock3 pandas numpy requests
 | `/alert <MÃ>` | Đăng ký nhận thông báo tự động khi cổ phiếu vi phạm ngưỡng kỹ thuật |
 | `/portfolio` | Xem danh mục giả định, quản trị vốn NAV và hạn mức rủi ro |
 | `/backtest` | Chạy kiểm thử chiến lược trên 3-6 tháng gần nhất, xuất tỷ lệ thắng (Win Rate), lợi nhuận bình quân và hệ số Profit Factor |
+| `/industries` | Mở danh sách ngành để chọn bộ lọc riêng |
+| `/industry banking` | Quét trực tiếp các mã thuộc ngành ngân hàng |
+
+Industry Filter lấy phân loại ICB từ `vnstock.Listing`, lưu vào SQLite rồi mới tải dữ liệu và chạy filter riêng. Các metric ngành không có trong nguồn sẽ hiện `N/A`/`INSUFFICIENT_DATA`, không được thay bằng số giả định. Bộ lọc hiện có các nhóm: ngân hàng, chứng khoán, bất động sản, thép, dầu khí, điện, bán lẻ, hóa chất và vận tải/cảng biển; mã chưa map giữ tên ICB nguồn và dùng trạng thái ngành khác.
 
 ---
 
@@ -101,3 +110,16 @@ py -m pip install python-telegram-bot vnstock3 pandas numpy requests
 - `risk_management/`: Module định cỡ vị thế theo NAV (`position_sizing.py`) và quản lý Trailing Stop/Target (`exit_manager.py`).
 - `backtesting/`: Công cụ mô phỏng giao dịch lịch sử 3-6 tháng và xuất báo cáo đánh giá hiệu suất (`backtest_engine.py`, `performance_report.py`).
 - `bot/`: Tầng giao diện Telegram Bot, các lệnh tương tác và bàn phím Inline Keyboard (`telegram_bot.py`, `ui_helpers.py`).
+- `core_logic/industry/`: Registry và filter riêng theo từng ngành.
+- `data_pipeline/industry_loader.py`: Adapter phân loại ICB từ vnstock.
+
+## 6. Những nơi cần sửa chiến lược v2
+
+- `core_logic/indicators.py`: EMA, ATR, RSI, CP và VR.
+- `core_logic/scoring.py`: phân vị 252 phiên và ba nhóm điểm.
+- `core_logic/strategy.py`: điều kiện tạo `BUY_CANDIDATE`.
+- `core_logic/fundamental_filter.py`: profile ngành và điều kiện BCTC.
+- `risk_management/position_sizing.py`: vốn, stop, target và khối lượng.
+- `backtesting/backtest_engine.py`: kiểm định dùng cùng gate với bot.
+
+Chiến lược hiện yêu cầu tối thiểu 420 phiên, dùng Stop `2 ATR`, Target `3 ATR`, và không phát ứng viên nếu thiếu dữ liệu hoặc một điều kiện cứng bị trượt. Điểm kỹ thuật được giữ ở giá trị gốc; chỉ làm tròn khi hiển thị.

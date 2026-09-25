@@ -1,26 +1,18 @@
 import json
 import logging
+from collections import Counter
 from datetime import datetime, timezone
 from telegram.ext import ContextTypes
 
-from config import DB_DIR
+from config import DB_DIR, MARKET_EXCHANGES
 from data_pipeline.fetcher import fetch_all_listed_tickers, fetch_stock_quote_history
 from core_logic.strategy import evaluate_ticker
 
 logger = logging.getLogger(__name__)
-
 CACHE_FILE = DB_DIR / "signals_cache.json"
 
-# ==========================================
-# QUÉT ĐỊNH KỲ TOÀN THỊ TRƯỜNG (chạy nền qua JobQueue)
-# - Không tính lại mỗi khi user bấm /signals nữa.
-# - Chạy trong thread riêng (asyncio.to_thread) để KHÔNG làm treo bot
-#   trong lúc quét (bot vẫn trả lời /start, /check... bình thường).
-# ==========================================
 
 def _save_cache_to_disk(payload: dict) -> None:
-    """Lưu kết quả quét ra file JSON để /signals vẫn đọc được ngay cả khi
-    bot vừa khởi động lại và job định kỳ chưa kịp chạy lần đầu."""
     try:
         with open(CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, default=str)
@@ -38,64 +30,132 @@ def _load_cache_from_disk() -> dict:
     return {}
 
 
+def _fetch_market_universe() -> tuple[list[str], dict[str, int]]:
+    """Fetch each exchange explicitly so a hidden single-exchange fallback is visible."""
+    all_tickers: list[str] = []
+    exchange_counts: dict[str, int] = {}
+
+    for exchange in MARKET_EXCHANGES:
+        try:
+            raw = fetch_all_listed_tickers(exchange=exchange) or []
+            tickers = [str(t).upper().strip() for t in raw if str(t).strip()]
+            exchange_counts[exchange] = len(tickers)
+            all_tickers.extend(tickers)
+            logger.info(f"[Scanner] Universe {exchange}: {len(tickers)} mã")
+        except Exception as exc:
+            exchange_counts[exchange] = 0
+            logger.exception(f"[Scanner] Không lấy được universe {exchange}: {exc}")
+
+    # Deduplicate while keeping exchange order stable.
+    unique = list(dict.fromkeys(all_tickers))
+    return unique, exchange_counts
+
+
+def _build_funnel(results: list[dict], no_price_data: int) -> dict:
+    counter = Counter()
+    for r in results:
+        counter["evaluated"] += 1
+        if r.get("prefilter_status") == "PASS":
+            counter["prefilter_pass"] += 1
+        elif r.get("prefilter_status") == "FAIL":
+            counter["prefilter_fail"] += 1
+
+        fstatus = str(r.get("fundamental_status", "NOT_EVALUATED"))
+        if fstatus == "PASSED":
+            counter["fundamental_pass"] += 1
+        elif fstatus not in {"NOT_EVALUATED", ""}:
+            counter["fundamental_checked_nonpass"] += 1
+
+        if r.get("technical_status") == "PASS":
+            counter["full_ta_pass"] += 1
+        if r.get("status") == "BUY_CANDIDATE":
+            counter["buy_candidate"] += 1
+        if r.get("status") == "TECHNICAL_ONLY":
+            counter["technical_only"] += 1
+        if r.get("status") == "RESEARCH":
+            counter["research"] += 1
+
+    counter["no_price_data"] = no_price_data
+    return dict(counter)
+
+
 def _scan_market_sync() -> dict:
-    """Phần việc NẶNG (gọi API cho từng mã) - chạy đồng bộ trong thread riêng."""
-    tickers = fetch_all_listed_tickers(exchange="HOSE")
-    logger.info(f"[Scanner] Bắt đầu quét định kỳ {len(tickers)} mã trên HOSE...")
+    """Scan configured exchanges with a measurable prefilter/fundamental/TA funnel."""
+    tickers, exchange_counts = _fetch_market_universe()
+    logger.info(
+        "[Scanner] Bắt đầu quét %s mã trên %s",
+        len(tickers),
+        ", ".join(MARKET_EXCHANGES),
+    )
 
     results = []
+    no_price_data = 0
+
     for i, ticker in enumerate(tickers, 1):
         try:
             df = fetch_stock_quote_history(ticker, days=450)
-            if df is not None and not df.empty:
-                res = evaluate_ticker(ticker, df)
-                results.append(res)
-        except Exception as e:
-            logger.warning(f"[Scanner] Lỗi khi xử lý mã {ticker}: {e}")
+            if df is None or df.empty:
+                no_price_data += 1
+                continue
+            results.append(evaluate_ticker(ticker, df))
+        except Exception as exc:
+            logger.warning(f"[Scanner] Lỗi khi xử lý mã {ticker}: {exc}")
 
         if i % 50 == 0:
             logger.info(f"[Scanner] Đã xử lý {i}/{len(tickers)} mã...")
 
+    funnel = _build_funnel(results, no_price_data)
     payload = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "exchanges": list(MARKET_EXCHANGES),
+        "exchange_counts": exchange_counts,
         "total_listed": len(tickers),
         "total_scanned": len(results),
+        "funnel": funnel,
         "results": results,
     }
-    logger.info(f"[Scanner] Hoàn tất: {len(results)}/{len(tickers)} mã có dữ liệu hợp lệ.")
+    logger.info(
+        "[Scanner] Hoàn tất: universe=%s, evaluated=%s, funnel=%s",
+        len(tickers),
+        len(results),
+        funnel,
+    )
     return payload
 
 
 async def run_full_market_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Callback cho JobQueue (hiện KHÔNG được đăng ký tự động chạy nền nữa - xem
-    build_application() trong telegram_bot.py - để tránh giành hạn mức API với
-    /check và /vn30. Vẫn giữ hàm này để có thể bật lại thủ công nếu cần)."""
     import asyncio
     try:
         payload = await asyncio.to_thread(_scan_market_sync)
-        save_scan_result(context.application, payload["results"], payload["total_listed"])
+        save_scan_result(
+            context.application,
+            payload["results"],
+            payload["total_listed"],
+            metadata={
+                "exchanges": payload.get("exchanges", []),
+                "exchange_counts": payload.get("exchange_counts", {}),
+                "funnel": payload.get("funnel", {}),
+            },
+        )
     except Exception as e:
         logger.error(f"[Scanner] Job quét định kỳ thất bại: {e}")
 
 
-def save_scan_result(application, results: list, total_listed: int) -> dict:
-    """Lưu kết quả quét (dù đến từ job nền hay quét live theo yêu cầu /signals) vào
-    bot_data + file cache - dùng chung 1 hàm để mọi nguồn quét đều cập nhật cùng 1 nơi
-    mà /signals và /filterstats cùng đọc."""
+def save_scan_result(application, results: list, total_listed: int, metadata: dict | None = None) -> dict:
     payload = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "total_listed": total_listed,
         "total_scanned": len(results),
         "results": results,
     }
+    if metadata:
+        payload.update(metadata)
     application.bot_data["last_scan"] = payload
     _save_cache_to_disk(payload)
     return payload
 
 
 def is_scan_fresh(application, max_age_minutes: int = 20) -> bool:
-    """True nếu kết quả quét gần nhất còn 'mới' (dưới max_age_minutes) - dùng để quyết
-    định /signals có thể trả lời ngay từ cache hay phải quét live lại từ đầu."""
     scan = get_latest_scan(application)
     if not scan or not scan.get("results") or not scan.get("timestamp"):
         return False
@@ -108,8 +168,6 @@ def is_scan_fresh(application, max_age_minutes: int = 20) -> bool:
 
 
 def get_latest_scan(application) -> dict:
-    """Lấy kết quả quét gần nhất: ưu tiên bộ nhớ (bot_data, nhanh),
-    fallback ra file cache trên đĩa (khi bot vừa khởi động lại)."""
     cached = application.bot_data.get("last_scan")
     if cached:
         return cached
