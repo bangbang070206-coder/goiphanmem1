@@ -1,5 +1,5 @@
 import html
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -49,7 +49,7 @@ def get_main_menu_keyboard() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(
-                "💼 Danh mục & vốn",
+                "💼 Quản trị vốn",
                 callback_data="cmd_portfolio",
             ),
             InlineKeyboardButton(
@@ -59,7 +59,7 @@ def get_main_menu_keyboard() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(
-                "📈 Backtest",
+                "📊 Backtest",
                 callback_data="cmd_backtest",
             ),
         ],
@@ -145,9 +145,9 @@ def get_industry_keyboard() -> InlineKeyboardMarkup:
 
 def format_welcome_message() -> str:
     return (
-        "🤖 <b>FINTECH STOCK ADVISOR BOT</b>\n\n"
+        "🤖 <b>STOCK ADVISOR BOT</b>\n\n"
         "Trợ lý phân tích cổ phiếu Việt Nam với "
-        "bộ lọc BCTC, phân tích kỹ thuật và quản trị rủi ro.\n\n"
+        "bộ lọc BCTC, phân tích kỹ thuật và quản trị vốn.\n\n"
 
         "📌 <b>Bot hiện tập trung vào:</b>\n"
         "• 📊 Quét rổ <b>VN30</b>\n"
@@ -156,7 +156,10 @@ def format_welcome_message() -> str:
         "• 🏭 Phân tích theo ngành\n"
         "• 💼 Quản trị vốn &amp; vị thế\n"
         "• 🔔 Theo dõi cảnh báo\n"
-        "• 📈 Kiểm định chiến lược\n\n"
+        "• 📊 Backtest chiến lược\n\n"
+
+        "🧩 <b>Chiến lược:</b> "
+        "<code>3.0.0-student-mvp</code>\n\n"
 
         "💡 <b>Cách dùng nhanh:</b>\n"
         "1️⃣ Chọn <b>VN30</b> hoặc <b>VN100</b> để tìm ứng viên\n"
@@ -171,247 +174,282 @@ def format_welcome_message() -> str:
 
 
 # ============================================================
-# RESULT CHECK
+# HELPER
+# ============================================================
+
+def _fmt_number(value, digits=2, suffix=""):
+    """
+    Format số an toàn cho UI.
+    """
+    if value is None:
+        return "N/A"
+
+    try:
+        return f"{float(value):.{digits}f}{suffix}"
+    except (TypeError, ValueError):
+        return html.escape(str(value))
+
+
+def _fmt_percent(value):
+    """
+    0.165 -> 16.51%
+    """
+    if value is None:
+        return "N/A"
+
+    try:
+        return f"{float(value) * 100:.2f}%"
+    except (TypeError, ValueError):
+        return html.escape(str(value))
+
+
+def _fmt_growth(value):
+    """
+    Format growth:
+    0.342 -> +34.28%
+    -0.037 -> -3.77%
+    """
+    if value is None:
+        return "N/A"
+
+    try:
+        number = float(value) * 100
+        return f"{number:+.2f}%"
+    except (TypeError, ValueError):
+        return html.escape(str(value))
+
+
+def _status_icon(status):
+    if status == "BUY_CANDIDATE":
+        return "🟢"
+
+    if status == "WATCHLIST":
+        return "🟡"
+
+    if status in (
+        "NOT_EVALUATED",
+        "DATA_INSUFFICIENT",
+        "DATA_UNAVAILABLE",
+    ):
+        return "⚪"
+
+    return "🔴"
+
+
+def _status_text(status):
+    mapping = {
+        "BUY_CANDIDATE": "ỨNG VIÊN MUA",
+        "WATCHLIST": "THEO DÕI",
+        "NOT_EVALUATED": "CHƯA ĐÁNH GIÁ",
+        "DATA_INSUFFICIENT": "CHƯA ĐỦ DỮ LIỆU",
+        "DATA_UNAVAILABLE": "CHƯA CÓ DỮ LIỆU",
+    }
+
+    return mapping.get(status, f"LOẠI BỎ ({status})")
+
+
+def _gate_icon(passed):
+    return "✅" if passed else "❌"
+
+
+# ============================================================
+# RESULT CHECK - STRATEGY 3.0
 # ============================================================
 
 def format_check_result(
     res: Dict[str, Any],
-    position_info: Dict[str, Any] = None,
+    position_info: Optional[Dict[str, Any]] = None,
 ) -> str:
 
-    ticker = res["ticker"]
-    status = res["status"]
+    ticker = res.get("ticker", "N/A")
+    status = res.get("status", "NOT_EVALUATED")
 
-    tech = res.get("technical", {})
-    fin = res.get("fundamental", {})
-    scoring = res.get("scoring", {})
+    tech = res.get("technical") or {}
+    fin = res.get("fundamental") or {}
+    scoring = res.get("scoring") or {}
+    gates = res.get("gates") or {}
+    industry = res.get("industry") or {}
 
     # --------------------------------------------------------
     # STATUS
     # --------------------------------------------------------
 
-    status_icon = (
-        "🟢"
-        if status == "BUY_CANDIDATE"
-        else "🟡"
-        if status == "WATCHLIST"
-        else "⚪"
-        if status in (
-            "NOT_EVALUATED",
-            "DATA_INSUFFICIENT",
-            "DATA_UNAVAILABLE",
-        )
-        else "🔴"
-    )
-
-    status_text = (
-        "ỨNG VIÊN MUA"
-        if status == "BUY_CANDIDATE"
-        else "THEO DÕI"
-        if status == "WATCHLIST"
-        else "CHƯA ĐÁNH GIÁ"
-        if status == "NOT_EVALUATED"
-        else "CHƯA ĐỦ DỮ LIỆU"
-        if status == "DATA_INSUFFICIENT"
-        else "CHƯA CÓ DỮ LIỆU"
-        if status == "DATA_UNAVAILABLE"
-        else f"LOẠI BỎ ({status})"
-    )
+    status_icon = _status_icon(status)
+    status_text = _status_text(status)
 
     # --------------------------------------------------------
     # HEADER
     # --------------------------------------------------------
 
-    msg = (
-        f"{status_icon} <b>ĐÁNH GIÁ {ticker}</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🧭 <b>Ngành:</b> "
-        f"{res.get('industry', {}).get('industry_name', 'Chưa xác định')}\n"
-        f"🧩 <b>Chiến lược:</b> "
-        f"{res.get('strategy_version', 'N/A')}\n"
-        f"📅 <b>Dữ liệu:</b> "
-        f"{tech.get('date', 'Mới nhất')}\n"
-        f"🏷 <b>Trạng thái:</b> "
-        f"{status_icon} <b>{status_text}</b>\n\n"
+    industry_name = industry.get(
+        "industry_name",
+        "Chưa xác định",
     )
 
-    # --------------------------------------------------------
-    # 1. BCTC / FUNDAMENTAL
-    # --------------------------------------------------------
+    strategy_version = res.get(
+        "strategy_version",
+        "N/A",
+    )
 
-    fin_passed = fin.get("is_passed", False)
+    data_date = tech.get(
+        "date",
+        "Mới nhất",
+    )
+
+    msg = (
+        f"{status_icon} <b>ĐÁNH GIÁ {html.escape(str(ticker))}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🏭 <b>Ngành:</b> "
+        f"{html.escape(str(industry_name))}\n"
+        f"🧩 <b>Chiến lược:</b> "
+        f"<code>{html.escape(str(strategy_version))}</code>\n"
+        f"📅 <b>Dữ liệu giá:</b> "
+        f"{html.escape(str(data_date))}\n\n"
+
+        f"🏷 <b>TRẠNG THÁI</b>\n"
+        f"{status_icon} <b>{status_text}</b>\n"
+        f"📌 Tín hiệu: "
+        f"<b>{html.escape(str(res.get('signal', 'N/A')))}</b>\n\n"
+    )
+
+    # ========================================================
+    # 1. BCTC
+    # ========================================================
+
+    fin_passed = bool(fin.get("is_passed", False))
     fin_icon = "✅" if fin_passed else "❌"
 
-    details = fin.get("details", {})
+    fin_score = fin.get("score")
+    fin_max = fin.get("max_score", 35)
+
+    roe = fin.get("roe")
+    rev_growth = fin.get("rev_growth")
+    np_growth = fin.get("np_growth")
 
     msg += (
-        f"📋 <b>1. BỘ LỌC CƠ BẢN:</b> "
-        f"{fin_icon}\n"
+        f"📋 <b>1. BCTC</b> {fin_icon}\n"
+        f"• Trạng thái: "
+        f"<b>{'ĐẠT' if fin_passed else 'CHƯA ĐẠT'}</b>\n"
+        f"• Điểm BCTC: "
+        f"<b>{fin_score if fin_score is not None else 'N/A'}/"
+        f"{fin_max}</b>\n"
+        f"• ROE: "
+        f"<code>{_fmt_percent(roe)}</code>\n"
+        f"• Tăng trưởng doanh thu: "
+        f"<code>{_fmt_growth(rev_growth)}</code>\n"
+        f"• Tăng trưởng LNST: "
+        f"<code>{_fmt_growth(np_growth)}</code>\n"
     )
 
-    groups = fin.get("groups") or details
+    fin_reason = fin.get("reason")
 
-    if groups:
-        for group_name, checks in groups.items():
+    if fin_reason:
+        msg += (
+            f"• Nhận xét: "
+            f"<i>{html.escape(str(fin_reason))}</i>\n"
+        )
 
-            msg += (
-                f"<b>{html.escape(str(group_name))}</b>:\n"
-            )
+    msg += "\n"
 
-            for check in checks:
+    # ========================================================
+    # 2. KỸ THUẬT
+    # ========================================================
 
-                icon = (
-                    "✅"
-                    if check.get("status") == "PASS"
-                    else "❌"
-                    if check.get("status") == "FAIL"
-                    else "⚪"
-                )
-
-                value = html.escape(
-                    str(check.get("value", "N/A"))
-                )
-
-                threshold = check.get("threshold")
-
-                suffix = (
-                    f" | Y/C "
-                    f"{html.escape(str(threshold))}"
-                    if threshold is not None
-                    else ""
-                )
-
-                msg += (
-                    f"{icon} "
-                    f"{html.escape(str(check.get('label', check.get('code', 'metric'))))}: "
-                    f"<code>{value}</code>"
-                    f"{suffix}\n"
-                )
-
-    else:
-        msg += "• Chưa có dữ liệu metric ngành.\n"
-
-    msg += (
-        f"⭐ <b>Điểm cơ bản:</b> "
-        f"{fin.get('score', 'N/A')}/"
-        f"{fin.get('max_score', 35)}\n\n"
+    technical_score = scoring.get(
+        "technical_score"
     )
 
-    # --------------------------------------------------------
-    # 2. CHẤM ĐIỂM KỸ THUẬT
-    # --------------------------------------------------------
-
-    ta_score = scoring.get("ta_score")
-
     msg += (
-        "📊 <b>2. ĐIỂM KỸ THUẬT</b>\n"
-        f"• Xu hướng: "
-        f"<b>{scoring.get('trend_score', 'N/A')}</b>/100\n"
-        f"• Động lượng RSI: "
-        f"<b>{scoring.get('momentum_score', 'N/A')}</b>/100\n"
-        f"• Giá &amp; Volume: "
-        f"<b>{scoring.get('volume_score', 'N/A')}</b>/100\n"
-        f"⭐ <b>TA Score:</b> "
-        f"<b>{ta_score if ta_score is not None else 'N/A'}</b>/100\n\n"
-    )
-
-    # --------------------------------------------------------
-    # 3. THÔNG SỐ KỸ THUẬT
-    # --------------------------------------------------------
-
-    msg += (
-        "📈 <b>3. THÔNG SỐ KỸ THUẬT</b>\n"
+        "📊 <b>2. KỸ THUẬT</b>\n"
+        f"⭐ Điểm kỹ thuật: "
+        f"<b>{_fmt_number(technical_score, 1)}</b>/65\n"
         f"• Giá đóng cửa: "
-        f"<b>{tech.get('close', 'N/A')}</b>\n"
+        f"<code>{_fmt_number(tech.get('close'))}</code>\n"
         f"• EMA20: "
-        f"<code>{tech.get('ema20', 'N/A')}</code> | "
-        f"EMA50: "
-        f"<code>{tech.get('ema50', 'N/A')}</code>\n"
+        f"<code>{_fmt_number(tech.get('ema20'))}</code>\n"
+        f"• EMA50: "
+        f"<code>{_fmt_number(tech.get('ema50'))}</code>\n"
         f"• RSI14: "
-        f"<code>{tech.get('rsi14', 'N/A')}</code> | "
-        f"ATR14: "
-        f"<code>{tech.get('atr14', 'N/A')}</code>\n"
+        f"<code>{_fmt_number(tech.get('rsi14'), 1)}</code>\n"
         f"• Volume Ratio: "
-        f"<code>{tech.get('vr', 'N/A')}x</code>\n\n"
+        f"<code>{_fmt_number(tech.get('volume_ratio'), 2)}x</code>\n"
+        f"• Khoảng cách EMA20: "
+        f"<code>{_fmt_number(tech.get('distance_atr'), 2)} ATR</code>\n"
+        f"• ATR14: "
+        f"<code>{_fmt_number(tech.get('atr14'))}</code>\n\n"
     )
 
-    # --------------------------------------------------------
-    # 4. GATE / TÍN HIỆU
-    # --------------------------------------------------------
+    # ========================================================
+# 4. TỔNG ĐIỂM
+# ========================================================
+    # ========================================================
+    # 4. TỔNG ĐIỂM
+    # ========================================================
 
-    gates = res.get("gates", {})
+    overall_score = scoring.get(
+        "ta_score"
+    )
 
-    if gates:
+    if overall_score is None:
+        overall_score = scoring.get(
+            "overall_score"
+        )
 
-        msg += "🧪 <b>4. KIỂM TRA TÍN HIỆU</b>\n"
+    fundamental_score = scoring.get(
+        "fundamental_score"
+    )
 
-        for gate_name, gate in gates.items():
+    msg += (
+        "⭐ <b>4. TỔNG ĐIỂM</b>\n"
+        f"• BCTC: "
+        f"<b>{_fmt_number(fundamental_score, 1)}</b>/35\n"
+        f"• Kỹ thuật: "
+        f"<b>{_fmt_number(technical_score, 1)}</b>/65\n"
+        f"• Tổng hợp: "
+        f"<b>{_fmt_number(overall_score, 1)}</b>/100\n\n"
+    )
 
-            icon = (
-                "✅"
-                if gate.get("passed")
-                else "❌"
-            )
+    # ========================================================
+    # 5. NHẬN XÉT
+    # ========================================================
 
+    msg += "💡 <b>5. NHẬN XÉT</b>\n"
+
+    reasons = res.get("reasons") or []
+
+    if reasons:
+        for reason in reasons:
             msg += (
-                f"{icon} <b>{html.escape(str(gate_name))}</b>: "
-                f"{html.escape(str(gate.get('observed', 'N/A')))}"
+                f"• {html.escape(str(reason))}\n"
             )
+    else:
+        msg += "• Chưa có nhận xét bổ sung.\n"
 
-            threshold = gate.get("threshold")
-
-            if threshold not in (None, ""):
-                msg += (
-                    f" | "
-                    f"{html.escape(str(threshold))}"
-                )
-
-            msg += "\n"
-
-        msg += "\n"
-
-    # --------------------------------------------------------
-    # 5. POSITION / REASON
-    # --------------------------------------------------------
+    # ========================================================
+    # 6. QUẢN TRỊ VỊ THẾ
+    # ========================================================
 
     if (
         status == "BUY_CANDIDATE"
         and position_info
         and position_info.get("can_buy")
     ):
-
         msg += (
-            "🎯 <b>5. QUẢN TRỊ VỊ THẾ</b>\n"
+            "\n🎯 <b>6. QUẢN TRỊ VỊ THẾ</b>\n"
             f"• Entry: "
-            f"<b>{position_info['entry_price']}</b>\n"
+            f"<b>{position_info.get('entry_price', 'N/A')}</b>\n"
             f"• Stop Loss: "
-            f"<b>{position_info['stop_loss']}</b>\n"
+            f"<b>{position_info.get('stop_loss', 'N/A')}</b>\n"
             f"• Target: "
-            f"<b>{position_info['target_price']}</b>\n"
+            f"<b>{position_info.get('target_price', 'N/A')}</b>\n"
             f"• Khối lượng: "
-            f"<b>{position_info['quantity']} CP</b>\n"
+            f"<b>{position_info.get('quantity', 'N/A')} CP</b>\n"
             f"• Giá trị: "
-            f"<b>{position_info['total_cost']:,.0f} VNĐ</b>\n"
+            f"<b>{position_info.get('total_cost', 0):,.0f} VNĐ</b>\n"
             f"• Tỷ trọng NAV: "
-            f"<b>{position_info['pct_nav']:.1f}%</b>\n"
+            f"<b>{position_info.get('pct_nav', 0):.1f}%</b>\n"
             f"• Rủi ro tối đa: "
-            f"<b>{position_info['risk_amount']:,.0f} VNĐ</b>\n"
+            f"<b>{position_info.get('risk_amount', 0):,.0f} VNĐ</b>\n"
         )
-
-    else:
-
-        msg += "💡 <b>Nhận xét:</b>\n"
-
-        reasons = res.get("reasons", [])
-
-        if reasons:
-
-            for reason in reasons:
-                msg += (
-                    f"• <i>{html.escape(str(reason))}</i>\n"
-                )
-
-        else:
-            msg += "• Chưa có nhận xét bổ sung.\n"
 
     return msg

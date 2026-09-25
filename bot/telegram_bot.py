@@ -7,30 +7,33 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
-    BotCommand,
 )
-
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     CallbackQueryHandler,
     ContextTypes,
 )
-
 from telegram.request import HTTPXRequest
 
-from config import (
-    TELEGRAM_BOT_TOKEN,
-    DEFAULT_NAV,
-)
+from config import TELEGRAM_BOT_TOKEN, DEFAULT_NAV
 
 from data_pipeline.fetcher import (
     fetch_stock_quote_history,
+    fetch_stock_financials,
     fetch_vn30_tickers,
+    fetch_all_listed_tickers,
     fetch_tickers_by_industry,
 )
 
+from core_logic.scanner import (
+    get_latest_scan,
+    save_scan_result,
+    is_scan_fresh,
+)
+
 from core_logic.strategy import evaluate_ticker
+
 from core_logic.industry import (
     get_industry_filter,
     list_industries,
@@ -43,16 +46,17 @@ from risk_management.position_sizing import (
 from backtesting.performance_report import (
     run_portfolio_backtest,
     format_backtest_message,
+    DEFAULT_BACKTEST_TICKERS,
 )
 
 from database.db_manager import (
     add_user_alert,
+    remove_user_alert,
     get_user_alerts,
 )
 
 from bot.ui_helpers import (
     get_main_menu_keyboard,
-    get_check_menu_keyboard,
     get_industry_keyboard,
     format_welcome_message,
     format_check_result,
@@ -60,60 +64,22 @@ from bot.ui_helpers import (
 
 from bot.chart_helpers import build_price_chart
 
-async def set_bot_commands(application):
-    commands = [
-        BotCommand("start", "Mở menu chính"),
-        BotCommand("check", "Phân tích cổ phiếu"),
-        BotCommand("vn30", "Quét VN30"),
-        BotCommand("vn100", "Quét VN100"),
-        BotCommand("industry", "Lọc theo ngành"),
-        BotCommand("industries", "Danh sách ngành"),
-        BotCommand("portfolio", "Quản trị vốn"),
-        BotCommand("alert", "Cảnh báo giá"),
-        BotCommand("backtest", "Backtest chiến lược"),
-    ]
 
-    await application.bot.set_my_commands(commands)
-# ============================================================
+# ==========================================
 # LOGGING
-# ============================================================
+# ==========================================
 
 logging.basicConfig(
     level=logging.INFO,
-    format=(
-        "%(asctime)s - "
-        "%(name)s - "
-        "%(levelname)s - "
-        "%(message)s"
-    ),
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 
 logger = logging.getLogger(__name__)
 
 
-# ============================================================
-# CẤU HÌNH
-# ============================================================
-
-VN30_PAGE_SIZE = 10
-VN100_PAGE_SIZE = 10
-
-VNSTOCK_GROUP_CACHE_TTL_HOURS = 12
-
-
-# ============================================================
-# CACHE VN100
-# ============================================================
-
-_VN100_CACHE = {
-    "data": None,
-    "fetched_at": None,
-}
-
-
-# ============================================================
+# ==========================================
 # HÀM TIỆN ÍCH
-# ============================================================
+# ==========================================
 
 async def safe_edit_message(
     msg: Message,
@@ -122,13 +88,10 @@ async def safe_edit_message(
 ):
     """
     Gửi tin nhắn HTML an toàn.
-
-    Nếu Telegram không chấp nhận HTML:
-    fallback về text thường.
+    Nếu Telegram từ chối HTML thì fallback về text thường.
     """
 
     try:
-
         await msg.edit_text(
             text,
             parse_mode="HTML",
@@ -136,10 +99,8 @@ async def safe_edit_message(
         )
 
     except Exception as e:
-
         logger.warning(
-            "Lỗi gửi HTML (%s), fallback về văn bản thường...",
-            e,
+            f"Lỗi gửi HTML ({e}), đang fallback về văn bản thuần..."
         )
 
         plain_text = re.sub(
@@ -148,122 +109,19 @@ async def safe_edit_message(
             text,
         )
 
-        try:
-
-            await msg.edit_text(
-                plain_text,
-                reply_markup=reply_markup,
-            )
-
-        except Exception:
-            pass
-
-
-# ============================================================
-# VN100
-# ============================================================
-
-def fetch_vn100_tickers() -> list:
-    """
-    Lấy danh sách VN100 trực tiếp từ vnstock Listing.
-
-    VN100:
-        Listing(source='VCI').symbols_by_group(group='VN100')
-
-    Cache 12 giờ.
-    """
-
-    from datetime import datetime
-    from data_pipeline.rate_limiter import throttle
-
-    now = datetime.now()
-
-    cached = _VN100_CACHE.get("data")
-    fetched_at = _VN100_CACHE.get("fetched_at")
-
-    if cached is not None and fetched_at is not None:
-
-        age_hours = (
-            now - fetched_at
-        ).total_seconds() / 3600
-
-        if age_hours < VNSTOCK_GROUP_CACHE_TTL_HOURS:
-            return cached
-
-    try:
-
-        from vnstock import Listing
-
-        listing = Listing(
-            source="VCI"
+        await msg.edit_text(
+            plain_text,
+            reply_markup=reply_markup,
         )
 
-        throttle()
 
-        result = listing.symbols_by_group(
-            group="VN100"
-        )
-
-        if hasattr(result, "tolist"):
-
-            tickers = [
-                str(t).upper().strip()
-                for t in result.tolist()
-            ]
-
-        else:
-
-            tickers = [
-                str(t).upper().strip()
-                for t in result
-            ]
-
-        tickers = list(
-            dict.fromkeys(
-                t
-                for t in tickers
-                if t
-            )
-        )
-
-        if not tickers:
-
-            raise ValueError(
-                "Danh sách VN100 trả về rỗng."
-            )
-
-        _VN100_CACHE["data"] = tickers
-        _VN100_CACHE["fetched_at"] = now
-
-        logger.info(
-            "Đã tải %s mã VN100 từ vnstock Listing API.",
-            len(tickers),
-        )
-
-        return tickers
-
-    except (
-        Exception,
-        SystemExit,
-        BaseException,
-    ) as e:
-
-        logger.warning(
-            "Lỗi khi lấy VN100 từ vnstock: %s",
-            e,
-        )
-
-        return []
-
-
-# ============================================================
-# START / MENU
-# ============================================================
+# ==========================================
+# START
+# ==========================================
 
 async def do_start(
     message: Message,
 ):
-
     text = format_welcome_message()
 
     await message.reply_html(
@@ -272,51 +130,19 @@ async def do_start(
     )
 
 
-# ============================================================
-# CHECK MENU
-# ============================================================
-
-async def do_check_menu(
-    message: Message,
-):
-
-    text = (
-        "🔎 <b>KIỂM TRA MỘT MÃ CỔ PHIẾU</b>\n\n"
-        "Nhập mã cổ phiếu bạn muốn phân tích.\n\n"
-        "Ví dụ:\n"
-        "• <code>/check HPG</code>\n"
-        "• <code>/check FPT</code>\n"
-        "• <code>/check VNM</code>\n\n"
-        "Bot sẽ kiểm tra:\n"
-        "📋 BCTC &amp; nền tảng cơ bản\n"
-        "📈 Xu hướng &amp; động lượng\n"
-        "📊 Thanh khoản\n"
-        "🛡 Quản trị rủi ro\n\n"
-        "<i>Hoặc chọn một rổ cổ phiếu bên dưới.</i>"
-    )
-
-    await message.reply_html(
-        text,
-        reply_markup=get_check_menu_keyboard(),
-    )
-
-
-# ============================================================
-# INDUSTRY
-# ============================================================
+# ==========================================
+# INDUSTRIES
+# ==========================================
 
 async def do_industries(
     message: Message,
 ):
-
     text = (
-        "🏭 <b>PHÂN TÍCH THEO NGÀNH</b>\n\n"
-        "Chọn một ngành để hệ thống:\n"
-        "• Lấy danh sách mã thuộc ngành\n"
-        "• Áp dụng bộ tiêu chí riêng\n"
-        "• Lọc BCTC trước\n"
-        "• Sau đó kiểm tra kỹ thuật\n\n"
-        "Bạn cũng có thể dùng:\n"
+        "🏭 <b>CHỌN NGÀNH PHÂN TÍCH</b>\n\n"
+        "Chọn một ngành để hệ thống lấy đúng danh sách mã, "
+        "áp dụng bộ tiêu chí riêng và trả kết quả "
+        "PASS/FAIL/INSUFFICIENT_DATA.\n\n"
+        "Mã ngành cũng có thể dùng trực tiếp:\n"
         "<code>/industry banking</code>"
     )
 
@@ -326,42 +152,372 @@ async def do_industries(
     )
 
 
+# ==========================================
+# CONSTANTS
+# ==========================================
+
+SIGNALS_PAGE_SIZE = 10
+VN30_PAGE_SIZE = 10
+SIGNALS_FRESHNESS_MINUTES = 20
+
+BACKTEST_LOOKBACK_DAYS = 120
+
+
+# ==========================================
+# RENDER RESULTS
+# ==========================================
+
+def _render_results_page(
+    results: list,
+    page: int,
+    page_size: int,
+    title_found: str,
+    title_empty: str,
+    meta_note: str,
+    page_prefix: str,
+    suggest_vn30: bool = False,
+):
+    """
+    Dựng nội dung + bàn phím phân trang
+    cho danh sách kết quả.
+    """
+
+    buy_candidates = [
+        r
+        for r in results
+        if r.get("status") == "BUY_CANDIDATE"
+    ]
+
+    buy_candidates.sort(
+        key=lambda x: (
+            x.get("scoring", {}).get("ta_score", 0)
+            or 0
+        ),
+        reverse=True,
+    )
+
+    if buy_candidates:
+        source_list = buy_candidates
+
+        header = (
+            f"{title_found}\n"
+            f"<i>{meta_note}</i>\n\n"
+        )
+
+    else:
+        source_list = []
+
+        header = (
+            f"{title_empty}\n"
+            f"<i>{meta_note}</i>\n\n"
+        )
+
+    total_items = len(source_list)
+
+    total_pages = max(
+        1,
+        (total_items + page_size - 1) // page_size,
+    )
+
+    page = max(
+        0,
+        min(page, total_pages - 1),
+    )
+
+    start = page * page_size
+
+    page_items = source_list[
+        start:start + page_size
+    ]
+
+    reply_text = (
+        header
+        + f"<i>Trang {page + 1}/{total_pages}</i>\n\n"
+    )
+
+    for i, c in enumerate(
+        page_items,
+        start + 1,
+    ):
+        score = c.get(
+            "scoring",
+            {},
+        ).get(
+            "ta_score",
+            "N/A",
+        )
+
+        close = c.get(
+            "technical",
+            {},
+        ).get(
+            "close",
+            "N/A",
+        )
+
+        fin_status = (
+            "✅ BCTC Đạt"
+            if c.get(
+                "fundamental",
+                {},
+            ).get(
+                "is_passed"
+            )
+            else "❌ BCTC Chưa đạt"
+        )
+
+        reply_text += (
+            f"{i}. <b>{c['ticker']}</b> - "
+            f"Giá: {close} | "
+            f"Điểm TA: <b>{score}/100</b> "
+            f"({fin_status})\n"
+        )
+
+    reply_text += (
+        "\n<i>Chỉ mã có đủ dữ liệu, BCTC đạt "
+        "và đạt điều kiện chiến lược mới được "
+        "đưa vào danh sách này.</i>"
+    )
+
+    keyboard = []
+
+    nav_row = []
+
+    if page > 0:
+        nav_row.append(
+            InlineKeyboardButton(
+                "◀️ Trước",
+                callback_data=(
+                    f"{page_prefix}{page - 1}"
+                ),
+            )
+        )
+
+    if page < total_pages - 1:
+        nav_row.append(
+            InlineKeyboardButton(
+                "Sau ▶️",
+                callback_data=(
+                    f"{page_prefix}{page + 1}"
+                ),
+            )
+        )
+
+    if nav_row:
+        keyboard.append(nav_row)
+
+    for c in page_items:
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    f"🔎 Kiểm tra {c['ticker']}",
+                    callback_data=(
+                        f"cmd_check_{c['ticker']}"
+                    ),
+                )
+            ]
+        )
+
+    if suggest_vn30:
+        keyboard.append(
+            [
+                InlineKeyboardButton(
+                    "📈 Thử quét nhanh VN30",
+                    callback_data="cmd_vn30",
+                )
+            ]
+        )
+
+    keyboard.append(
+        [
+            InlineKeyboardButton(
+                "🔙 Quay lại Menu Chính",
+                callback_data="cmd_start",
+            )
+        ]
+    )
+
+    return (
+        reply_text,
+        InlineKeyboardMarkup(keyboard),
+    )
+
+
+# ==========================================
+# QUÉT TOÀN THỊ TRƯỜNG
+# ==========================================
+
+async def _scan_market_async(
+    progress_cb=None,
+):
+    """
+    Quét toàn thị trường HOSE.
+    """
+
+    tickers = fetch_all_listed_tickers(
+        exchange="HOSE",
+    )
+
+    sem = asyncio.Semaphore(5)
+
+    async def _process(ticker):
+        async with sem:
+
+            try:
+                df = await asyncio.to_thread(
+                    fetch_stock_quote_history,
+                    ticker,
+                    450,
+                )
+
+                if (
+                    df is not None
+                    and not df.empty
+                ):
+                    return await asyncio.to_thread(
+                        evaluate_ticker,
+                        ticker,
+                        df,
+                    )
+
+            except Exception as e:
+                logger.warning(
+                    "[Signals] Lỗi khi xử lý mã %s: %s",
+                    ticker,
+                    e,
+                )
+
+            return None
+
+    tasks = [
+        asyncio.create_task(
+            _process(ticker)
+        )
+        for ticker in tickers
+    ]
+
+    results = []
+
+    done_count = 0
+
+    for task in asyncio.as_completed(tasks):
+
+        result = await task
+
+        done_count += 1
+
+        if result is not None:
+            results.append(result)
+
+        if progress_cb:
+            await progress_cb(
+                done_count,
+                len(tickers),
+            )
+
+    return (
+        results,
+        len(tickers),
+    )
+
+
+# ==========================================
+# QUÉT DANH SÁCH MÃ
+# ==========================================
+
+async def _scan_tickers_async(
+    tickers,
+    progress_cb=None,
+):
+    sem = asyncio.Semaphore(5)
+
+    async def _process(
+        ticker,
+    ):
+        async with sem:
+
+            try:
+                df = await asyncio.to_thread(
+                    fetch_stock_quote_history,
+                    ticker,
+                    450,
+                )
+
+                if (
+                    df is not None
+                    and not df.empty
+                ):
+                    return await asyncio.to_thread(
+                        evaluate_ticker,
+                        ticker,
+                        df,
+                    )
+
+            except Exception as exc:
+                logger.warning(
+                    "Lỗi khi xử lý mã %s: %s",
+                    ticker,
+                    exc,
+                )
+
+            return None
+
+    tasks = [
+        asyncio.create_task(
+            _process(ticker)
+        )
+        for ticker in tickers
+    ]
+
+    results = []
+
+    for index, task in enumerate(
+        asyncio.as_completed(tasks),
+        1,
+    ):
+        result = await task
+
+        if result is not None:
+            results.append(result)
+
+        if progress_cb:
+            await progress_cb(
+                index,
+                len(tickers),
+            )
+
+    return results
+
+
+# ==========================================
+# QUÉT NGÀNH
+# ==========================================
+
 async def _scan_industry_async(
     tickers,
     progress_cb=None,
 ):
     """
-    Giai đoạn 1:
-        lọc BCTC trước.
-
-    Giai đoạn 2:
-        chỉ mã đạt BCTC mới tải dữ liệu kỹ thuật.
+    Lọc fundamentals trước,
+    sau đó mới tải kỹ thuật.
     """
 
-    sem = asyncio.Semaphore(10)
-
-    # ========================================================
-    # PHASE 1 - FUNDAMENTAL
-    # ========================================================
+    sem = asyncio.Semaphore(5)
 
     async def _financial_only(
         ticker,
     ):
-
         async with sem:
 
             try:
-
                 return await asyncio.to_thread(
                     evaluate_ticker,
                     ticker,
                     None,
                     include_technical=False,
-                    use_industry_filter=True,
                 )
 
             except Exception as exc:
-
                 logger.warning(
                     "Lỗi lọc tài chính mã %s: %s",
                     ticker,
@@ -385,14 +541,14 @@ async def _scan_industry_async(
         ),
         1,
     ):
-
         result = await task
 
         if result is not None:
-            financial_results.append(result)
+            financial_results.append(
+                result
+            )
 
         if progress_cb:
-
             await progress_cb(
                 index,
                 len(tickers),
@@ -405,32 +561,25 @@ async def _scan_industry_async(
         if result.get(
             "fundamental",
             {},
-        ).get("is_passed")
+        ).get(
+            "is_passed"
+        )
     ]
 
     if not passed:
         return financial_results
 
-    # ========================================================
-    # PHASE 2 - TECHNICAL
-    # ========================================================
-
     async def _technical(
         ticker,
     ):
-
         async with sem:
 
             try:
-
                 df = await asyncio.to_thread(
                     fetch_stock_quote_history,
                     ticker,
                     700,
                 )
-
-                if df is None or df.empty:
-                    return None
 
                 return await asyncio.to_thread(
                     evaluate_ticker,
@@ -439,7 +588,6 @@ async def _scan_industry_async(
                 )
 
             except Exception as exc:
-
                 logger.warning(
                     "Lỗi kỹ thuật mã %s: %s",
                     ticker,
@@ -463,14 +611,14 @@ async def _scan_industry_async(
         ),
         1,
     ):
-
         result = await task
 
         if result is not None:
-            technical_results.append(result)
+            technical_results.append(
+                result
+            )
 
         if progress_cb:
-
             await progress_cb(
                 index,
                 len(passed),
@@ -484,7 +632,6 @@ async def do_industry(
     message: Message,
     industry_code: str,
 ):
-
     industry = get_industry_filter(
         industry_code
     )
@@ -499,8 +646,8 @@ async def do_industry(
         await message.reply_html(
             f"⚠️ Mã ngành "
             f"<code>{industry_code}</code> "
-            f"chưa được hỗ trợ.\n\n"
-            f"Mã hợp lệ:\n"
+            f"chưa được hỗ trợ.\n"
+            f"Mã hợp lệ: "
             f"<code>{supported}</code>"
         )
 
@@ -510,8 +657,8 @@ async def do_industry(
 
         await message.reply_html(
             "⚠️ <b>Ngành khác</b> chỉ là nhóm dự phòng "
-            "cho mã chưa map ICB.\n\n"
-            "Hãy chọn một ngành cụ thể."
+            "cho mã chưa map ICB, không mở quét toàn bộ "
+            "nhóm này. Hãy chọn một ngành cụ thể."
         )
 
         return
@@ -524,16 +671,16 @@ async def do_industry(
 
         await message.reply_html(
             f"⚠️ Chưa lấy được mã nào cho ngành "
-            f"<b>{industry.display_name}</b>.\n\n"
+            f"<b>{industry.display_name}</b>. "
             "Kiểm tra lại dữ liệu ICB hoặc thử lại sau."
         )
 
         return
 
     loading = await message.reply_html(
-        f"⏳ Đang lọc ngành "
-        f"<b>{industry.display_name}</b>\n\n"
-        f"📋 BCTC: 0/{len(tickers)} mã"
+        f"⏳ Đang lọc tài chính ngành "
+        f"<b>{industry.display_name}</b>: "
+        f"0/{len(tickers)} mã..."
     )
 
     async def progress(
@@ -541,22 +688,21 @@ async def do_industry(
         total,
         phase,
     ):
-
         if (
             done % 5 == 0
             or done == total
         ):
-
-            if phase == "financial":
-                label = "📋 BCTC"
-            else:
-                label = "📈 Kỹ thuật"
+            label = (
+                "lọc tài chính"
+                if phase == "financial"
+                else "tải kỹ thuật"
+            )
 
             await safe_edit_message(
                 loading,
-                f"⏳ Đang phân tích "
-                f"<b>{industry.display_name}</b>\n\n"
-                f"{label}: {done}/{total} mã",
+                f"⏳ Đang {label} ngành "
+                f"<b>{industry.display_name}</b>: "
+                f"{done}/{total} mã..."
             )
 
     results = await _scan_industry_async(
@@ -570,57 +716,56 @@ async def do_industry(
         if result.get(
             "fundamental",
             {},
-        ).get("is_passed")
+        ).get(
+            "is_passed"
+        )
     ]
 
     candidates.sort(
-        key=lambda result:
+        key=lambda result: (
             result.get(
                 "fundamental",
                 {},
-            ).get("score") or 0,
+            ).get("score")
+            or 0
+        ),
         reverse=True,
     )
 
     lines = [
-        f"🏭 <b>NGÀNH "
+        f"🏭 <b>KẾT QUẢ NGÀNH "
         f"{industry.display_name.upper()}</b>",
-        "",
-        f"📋 Đã xử lý: "
+        f"Đã xử lý: "
         f"{len(results)}/{len(tickers)} mã",
-        f"✅ Đạt BCTC: "
-        f"{len(candidates)} mã",
         "",
     ]
 
     if not candidates:
-
         lines.append(
             "🟡 Chưa có mã đạt bộ lọc ngành."
         )
 
-    else:
+    for result in candidates:
 
-        for result in candidates:
+        fin = result.get(
+            "fundamental",
+            {},
+        )
 
-            fin = result.get(
-                "fundamental",
-                {},
-            )
-
-            lines.append(
-                f"✅ <b>{result['ticker']}</b>\n"
-                f"   • Điểm ngành: "
-                f"<b>{fin.get('score', 'N/A')}</b>\n"
-                f"   • Kỹ thuật: "
-                f"<b>{result.get('status', 'N/A')}</b>\n"
-                f"   • <code>/check "
-                f"{result['ticker']}</code>"
-            )
+        lines.append(
+            f"✅ <b>{result['ticker']}</b> | "
+            f"{fin.get('status')} | "
+            f"Điểm ngành: "
+            f"{fin.get('score', 'N/A')} | "
+            f"Kỹ thuật: "
+            f"{result.get('status')} | "
+            f"<code>/check "
+            f"{result['ticker']}</code>"
+        )
 
     lines.append(
-        "\n<i>INSUFFICIENT_DATA không được "
-        "xem là FAIL.</i>"
+        "\n<i>Thiếu chỉ số được ghi "
+        "INSUFFICIENT_DATA, không bị xem là FAIL.</i>"
     )
 
     await safe_edit_message(
@@ -630,248 +775,155 @@ async def do_industry(
     )
 
 
-# ============================================================
-# RENDER VN30 / VN100
-# ============================================================
+# ==========================================
+# SIGNALS
+# ==========================================
 
-def _render_results_page(
-    results: list,
-    page: int,
-    page_size: int,
-    title_found: str,
-    title_empty: str,
-    meta_note: str,
-    page_prefix: str,
-    market_buttons: bool = True,
+async def do_signals(
+    message: Message,
+    application,
+    page: int = 0,
+    edit_target: Message = None,
 ):
-    """
-    Dùng chung cho VN30 và VN100.
-    """
-
-    buy_candidates = [
-        r
-        for r in results
-        if r.get("status")
-        == "BUY_CANDIDATE"
-    ]
-
-    buy_candidates.sort(
-        key=lambda x:
-            x.get(
-                "scoring",
-                {},
-            ).get("ta_score", 0)
-            or 0,
-        reverse=True,
+    fresh = is_scan_fresh(
+        application,
+        max_age_minutes=SIGNALS_FRESHNESS_MINUTES,
     )
 
-    if buy_candidates:
+    if not fresh:
 
-        source_list = buy_candidates
+        loading_text = (
+            "⏳ <i>Chưa có dữ liệu mới - đang quét "
+            "toàn thị trường ngay bây giờ "
+            "(đã xử lý 0 mã)...</i>"
+        )
 
-        header = (
-            f"{title_found}\n"
-            f"<i>{meta_note}</i>\n\n"
+        if edit_target:
+
+            await safe_edit_message(
+                edit_target,
+                loading_text,
+            )
+
+            target = edit_target
+
+        else:
+
+            target = await message.reply_html(
+                loading_text
+            )
+
+        async def _progress(
+            done,
+            total,
+        ):
+            if (
+                done % 5 == 0
+                or done == total
+            ):
+                try:
+                    await safe_edit_message(
+                        target,
+                        f"⏳ <i>Đang quét toàn thị trường - "
+                        f"đã xử lý {done}/{total} mã...</i>",
+                    )
+
+                except Exception:
+                    pass
+
+        results, total_listed = (
+            await _scan_market_async(
+                progress_cb=_progress
+            )
+        )
+
+        scan = save_scan_result(
+            application,
+            results,
+            total_listed,
+        )
+
+        edit_target = target
+
+    else:
+
+        scan = get_latest_scan(
+            application
+        )
+
+        results = scan.get(
+            "results"
+        )
+
+    scanned_at = scan.get(
+        "timestamp",
+        "",
+    )
+
+    total_listed = scan.get(
+        "total_listed",
+        len(results),
+    )
+
+    meta_note = (
+        f"{len(results)}/{total_listed} mã có dữ liệu | "
+        f"Cập nhật: {scanned_at} UTC"
+    )
+
+    reply_text, markup = _render_results_page(
+        results,
+        page,
+        SIGNALS_PAGE_SIZE,
+        title_found=(
+            "🎯 <b>DANH SÁCH CỔ PHIẾU "
+            "ĐẠT TÍN HIỆU MUA</b>"
+        ),
+        title_empty=(
+            "🟡 <b>Hiện thị trường chưa có mã nào "
+            "vượt ngưỡng MUA.</b>"
+        ),
+        meta_note=meta_note,
+        page_prefix="cmd_signals_p",
+        suggest_vn30=True,
+    )
+
+    if edit_target:
+
+        await safe_edit_message(
+            edit_target,
+            reply_text,
+            markup,
         )
 
     else:
 
-        source_list = []
-
-        header = (
-            f"{title_empty}\n"
-            f"<i>{meta_note}</i>\n\n"
+        msg = await message.reply_html(
+            "🔎 <i>Đang tổng hợp kết quả...</i>"
         )
 
-    total_items = len(source_list)
-
-    total_pages = max(
-        1,
-        (
-            total_items
-            + page_size
-            - 1
-        )
-        // page_size,
-    )
-
-    page = max(
-        0,
-        min(
-            page,
-            total_pages - 1,
-        ),
-    )
-
-    start = page * page_size
-
-    page_items = source_list[
-        start:start + page_size
-    ]
-
-    reply_text = (
-        header
-        + f"<i>Trang "
-        f"{page + 1}/{total_pages}</i>\n\n"
-    )
-
-    for i, candidate in enumerate(
-        page_items,
-        start + 1,
-    ):
-
-        score = candidate.get(
-            "scoring",
-            {},
-        ).get(
-            "ta_score",
-            "N/A",
+        await safe_edit_message(
+            msg,
+            reply_text,
+            markup,
         )
 
-        close = candidate.get(
-            "technical",
-            {},
-        ).get(
-            "close",
-            "N/A",
-        )
 
-        fin_passed = candidate.get(
-            "fundamental",
-            {},
-        ).get(
-            "is_passed"
-        )
+# ==========================================
+# VN30
+# ==========================================
 
-        fin_status = (
-            "✅ BCTC đạt"
-            if fin_passed
-            else "❌ BCTC chưa đạt"
-        )
-
-        reply_text += (
-            f"{i}. <b>{candidate['ticker']}</b>\n"
-            f"   💰 Giá: {close} | "
-            f"⭐ TA: <b>{score}/100</b>\n"
-            f"   {fin_status}\n\n"
-        )
-
-    reply_text += (
-        "<i>BUY = BCTC đạt + thanh khoản đạt "
-        "+ tổng điểm đạt ngưỡng "
-        "+ có tín hiệu kỹ thuật xác nhận.</i>"
-    )
-
-    keyboard = []
-
-    # ========================================================
-    # PAGINATION
-    # ========================================================
-
-    nav_row = []
-
-    if page > 0:
-
-        nav_row.append(
-            InlineKeyboardButton(
-                "◀️ Trước",
-                callback_data=(
-                    f"{page_prefix}"
-                    f"{page - 1}"
-                ),
-            )
-        )
-
-    if page < total_pages - 1:
-
-        nav_row.append(
-            InlineKeyboardButton(
-                "Sau ▶️",
-                callback_data=(
-                    f"{page_prefix}"
-                    f"{page + 1}"
-                ),
-            )
-        )
-
-    if nav_row:
-        keyboard.append(nav_row)
-
-    # ========================================================
-    # CHECK TỪNG MÃ
-    # ========================================================
-
-    for candidate in page_items:
-
-        keyboard.append(
-            [
-                InlineKeyboardButton(
-                    f"🔎 Kiểm tra {candidate['ticker']}",
-                    callback_data=(
-                        f"cmd_check_"
-                        f"{candidate['ticker']}"
-                    ),
-                )
-            ]
-        )
-
-    # ========================================================
-    # CHUYỂN VN30 / VN100
-    # ========================================================
-
-    if market_buttons:
-
-        keyboard.append(
-            [
-                InlineKeyboardButton(
-                    "📊 VN30",
-                    callback_data="cmd_vn30",
-                ),
-                InlineKeyboardButton(
-                    "📈 VN100",
-                    callback_data="cmd_vn100",
-                ),
-            ]
-        )
-
-    keyboard.append(
-        [
-            InlineKeyboardButton(
-                "🔙 Menu Chính",
-                callback_data="cmd_start",
-            )
-        ]
-    )
-
-    return (
-        reply_text,
-        InlineKeyboardMarkup(keyboard),
-    )
-
-
-# ============================================================
-# SCAN GENERIC INDEX
-# ============================================================
-
-async def _scan_index_async(
-    tickers,
-    index_name,
+async def _scan_vn30_async(
     progress_cb=None,
 ):
     """
-    Scan VN30 / VN100.
-
-    Không dùng industry filter.
+    Quét rổ VN30 song song.
     """
 
-    if not tickers:
-        return [], 0
+    tickers = fetch_vn30_tickers()
 
-    sem = asyncio.Semaphore(10)
+    sem = asyncio.Semaphore(5)
 
-    async def _process(
-        ticker,
-    ):
+    async def _process(ticker):
 
         async with sem:
 
@@ -883,26 +935,26 @@ async def _scan_index_async(
                     450,
                 )
 
-                if df is None or df.empty:
-                    return None
+                if (
+                    df is not None
+                    and not df.empty
+                ):
 
-                return await asyncio.to_thread(
-                    evaluate_ticker,
-                    ticker,
-                    df,
-                    use_industry_filter=False,
-                )
+                    return await asyncio.to_thread(
+                        evaluate_ticker,
+                        ticker,
+                        df,
+                    )
 
-            except Exception as exc:
+            except Exception as e:
 
                 logger.warning(
-                    "[%s] Lỗi khi xử lý %s: %s",
-                    index_name,
+                    "[VN30] Lỗi khi xử lý mã %s: %s",
                     ticker,
-                    exc,
+                    e,
                 )
 
-                return None
+            return None
 
     tasks = [
         asyncio.create_task(
@@ -915,9 +967,7 @@ async def _scan_index_async(
 
     done_count = 0
 
-    for task in asyncio.as_completed(
-        tasks
-    ):
+    for task in asyncio.as_completed(tasks):
 
         result = await task
 
@@ -927,7 +977,6 @@ async def _scan_index_async(
             results.append(result)
 
         if progress_cb:
-
             await progress_cb(
                 done_count,
                 len(tickers),
@@ -939,20 +988,18 @@ async def _scan_index_async(
     )
 
 
-# ============================================================
-# VN30
-# ============================================================
-
 async def do_vn30(
     message: Message,
     page: int = 0,
     edit_target: Message = None,
 ):
+    """
+    Quét trực tiếp rổ VN30.
+    """
 
     loading_text = (
-        "⏳ <i>Đang quét "
-        "<b>VN30</b>...\n\n"
-        "📊 Đã xử lý: 0 mã</i>"
+        "⏳ <i>Đang quét nhanh rổ VN30 - "
+        "đã xử lý 0 mã...</i>"
     )
 
     if edit_target:
@@ -974,39 +1021,24 @@ async def do_vn30(
         done,
         total,
     ):
-
-        if done % 5 == 0 or done == total:
+        if (
+            done % 5 == 0
+            or done == total
+        ):
 
             try:
 
                 await safe_edit_message(
                     target,
-                    f"⏳ <i>Đang quét "
-                    f"<b>VN30</b>...\n\n"
-                    f"📊 Đã xử lý: "
-                    f"{done}/{total} mã</i>",
+                    f"⏳ <i>Đang quét nhanh rổ VN30 - "
+                    f"đã xử lý {done}/{total} mã...</i>",
                 )
 
             except Exception:
                 pass
 
-    tickers = fetch_vn30_tickers()
-
-    if not tickers:
-
-        await safe_edit_message(
-            target,
-            "⚠️ <b>Không lấy được danh sách VN30.</b>\n\n"
-            "Vui lòng thử lại sau ít phút.",
-            get_main_menu_keyboard(),
-        )
-
-        return
-
-    results, total = await _scan_index_async(
-        tickers,
-        "VN30",
-        progress_cb=_progress,
+    results, total = await _scan_vn30_async(
+        progress_cb=_progress
     )
 
     if not results:
@@ -1014,23 +1046,14 @@ async def do_vn30(
         await safe_edit_message(
             target,
             "⚠️ <i>Không lấy được dữ liệu "
-            "cho rổ VN30.</i>",
-            get_main_menu_keyboard(),
+            "cho rổ VN30. "
+            "Vui lòng thử lại sau ít phút.</i>",
         )
 
         return
 
-    buy_count = sum(
-        1
-        for result in results
-        if result.get("status")
-        == "BUY_CANDIDATE"
-    )
-
     meta_note = (
-        f"Quét trực tiếp "
-        f"{len(results)}/{total} mã VN30 | "
-        f"BUY: {buy_count} | "
+        f"Quét trực tiếp {len(results)}/{total} mã VN30 | "
         f"Vừa cập nhật"
     )
 
@@ -1039,11 +1062,12 @@ async def do_vn30(
         page,
         VN30_PAGE_SIZE,
         title_found=(
-            "🎯 <b>TÍN HIỆU MUA TRONG RỔ VN30</b>"
+            "🎯 <b>TÍN HIỆU MUA "
+            "TRONG RỔ VN30</b>"
         ),
         title_empty=(
-            "🟡 <b>VN30 hiện chưa có "
-            "mã đạt tín hiệu MUA.</b>"
+            "🟡 <b>Rổ VN30 hiện chưa có mã nào "
+            "đạt tín hiệu MUA.</b>"
         ),
         meta_note=meta_note,
         page_prefix="cmd_vn30_p",
@@ -1056,269 +1080,197 @@ async def do_vn30(
     )
 
 
-# ============================================================
-# VN100
-# ============================================================
+# ==========================================
+# FILTER STATS
+# ==========================================
 
-async def do_vn100(
+async def do_filterstats(
     message: Message,
-    page: int = 0,
-    edit_target: Message = None,
+    application,
 ):
-
-    loading_text = (
-        "⏳ <i>Đang quét "
-        "<b>VN100</b>...\n\n"
-        "📊 Đã xử lý: 0 mã</i>"
+    scan = get_latest_scan(
+        application
     )
 
-    if edit_target:
-
-        await safe_edit_message(
-            edit_target,
-            loading_text,
-        )
-
-        target = edit_target
-
-    else:
-
-        target = await message.reply_html(
-            loading_text
-        )
-
-    async def _progress(
-        done,
-        total,
-    ):
-
-        if done % 10 == 0 or done == total:
-
-            try:
-
-                await safe_edit_message(
-                    target,
-                    f"⏳ <i>Đang quét "
-                    f"<b>VN100</b>...\n\n"
-                    f"📊 Đã xử lý: "
-                    f"{done}/{total} mã</i>",
-                )
-
-            except Exception:
-                pass
-
-    tickers = fetch_vn100_tickers()
-
-    if not tickers:
-
-        await safe_edit_message(
-            target,
-            "⚠️ <b>Không lấy được danh sách VN100.</b>\n\n"
-            "Kiểm tra phiên bản vnstock hoặc thử lại sau.",
-            get_main_menu_keyboard(),
-        )
-
-        return
-
-    results, total = await _scan_index_async(
-        tickers,
-        "VN100",
-        progress_cb=_progress,
+    results = (
+        scan.get("results")
+        if scan
+        else None
     )
 
     if not results:
 
-        await safe_edit_message(
-            target,
-            "⚠️ <i>Không lấy được dữ liệu "
-            "cho rổ VN100.</i>\n\n"
-            "Vui lòng thử lại sau ít phút.",
-            get_main_menu_keyboard(),
+        await message.reply_html(
+            "⏳ <i>Chưa có dữ liệu quét toàn thị trường "
+            "để thống kê.</i>"
         )
 
         return
 
-    buy_count = sum(
-        1
-        for result in results
-        if result.get("status")
-        == "BUY_CANDIDATE"
+    total = len(results)
+
+    status_counts = {}
+
+    reason_counts = {
+        "ROE": 0,
+        "Nợ/VCSH": 0,
+        "Tăng trưởng DT": 0,
+        "Tăng trưởng LNST": 0,
+        "CFO": 0,
+    }
+
+    for result in results:
+
+        fin = result.get(
+            "fundamental",
+            {},
+        ) or {}
+
+        status = fin.get(
+            "status",
+            "UNKNOWN",
+        )
+
+        status_counts[status] = (
+            status_counts.get(
+                status,
+                0,
+            ) + 1
+        )
+
+        reason = fin.get(
+            "reason"
+        ) or ""
+
+        for key in reason_counts:
+
+            if key in reason:
+                reason_counts[key] += 1
+
+    text = (
+        "📊 <b>THỐNG KÊ BỘ LỌC BCTC</b>\n"
+        f"<i>Tổng số mã có dữ liệu: {total}</i>\n\n"
+        "<b>Theo trạng thái:</b>\n"
     )
 
-    meta_note = (
-        f"Quét trực tiếp "
-        f"{len(results)}/{total} mã VN100 | "
-        f"BUY: {buy_count} | "
-        f"Vừa cập nhật"
+    for status, count in sorted(
+        status_counts.items(),
+        key=lambda x: -x[1],
+    ):
+
+        pct = (
+            count / total * 100
+            if total
+            else 0
+        )
+
+        text += (
+            f"• <code>{status}</code>: "
+            f"{count} mã ({pct:.1f}%)\n"
+        )
+
+    text += (
+        "\n<b>Bị loại vì từng tiêu chí cụ thể</b> "
+        "<i>(1 mã có thể trượt nhiều tiêu chí cùng lúc):</i>\n"
     )
 
-    reply_text, markup = _render_results_page(
-        results,
-        page,
-        VN100_PAGE_SIZE,
-        title_found=(
-            "🎯 <b>TÍN HIỆU MUA TRONG RỔ VN100</b>"
+    for name, count in reason_counts.items():
+
+        text += (
+            f"• {name}: {count} mã\n"
+        )
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "🔙 Menu Chính",
+                callback_data="cmd_start",
+            )
+        ]
+    ]
+
+    await message.reply_html(
+        text,
+        reply_markup=InlineKeyboardMarkup(
+            keyboard
         ),
-        title_empty=(
-            "🟡 <b>VN100 hiện chưa có "
-            "mã đạt tín hiệu MUA.</b>"
-        ),
-        meta_note=meta_note,
-        page_prefix="cmd_vn100_p",
-    )
-
-    await safe_edit_message(
-        target,
-        reply_text,
-        markup,
     )
 
 
-# ============================================================
-# CHECK 1 MÃ
-# ============================================================
+# ==========================================
+# CHECK MÃ
+# ==========================================
 
 async def do_check(
     message: Message,
     ticker: str,
 ):
-
     ticker = ticker.upper().strip()
 
     msg = await message.reply_html(
-        f"⏳ <i>Đang phân tích "
-        f"<b>{ticker}</b>...</i>\n\n"
-        "📋 BCTC + 📈 kỹ thuật + 🛡 rủi ro"
+        f"⏳ <i>Đang phân tích dữ liệu "
+        f"cho mã {ticker}...</i>"
     )
 
-    try:
+    df = fetch_stock_quote_history(
+        ticker,
+        days=450,
+    )
 
-        df = await asyncio.to_thread(
-            fetch_stock_quote_history,
-            ticker,
-            450,
-        )
-
-        if df is None or df.empty:
-
-            await safe_edit_message(
-                msg,
-                f"⚠️ Không lấy được dữ liệu "
-                f"cho mã <b>{ticker}</b>.",
-                get_main_menu_keyboard(),
-            )
-
-            return
-
-        res = await asyncio.to_thread(
-            evaluate_ticker,
-            ticker,
-            df,
-        )
-
-    except Exception as exc:
-
-        logger.exception(
-            "Lỗi khi check %s",
-            ticker,
-        )
-
-        await safe_edit_message(
-            msg,
-            f"⚠️ Không thể phân tích "
-            f"<b>{ticker}</b> lúc này.\n\n"
-            f"<code>{exc}</code>",
-            get_main_menu_keyboard(),
-        )
-
-        return
-
-    # ========================================================
-    # POSITION SIZING
-    # ========================================================
+    res = evaluate_ticker(
+        ticker,
+        df,
+    )
 
     pos_info = None
 
-    technical = (
-        res.get("technical")
-        or {}
-    )
-
     if (
-        technical.get("close")
-        and technical.get("atr14")
+        res.get("technical")
+        and res["technical"].get("close")
+        and res["technical"].get("atr14")
     ):
 
-        try:
-
-            pos_info = calculate_position_size(
-                entry_price=technical["close"],
-                atr0=technical["atr14"],
-                nav=DEFAULT_NAV,
-                cash_available=DEFAULT_NAV,
-            )
-
-        except Exception as exc:
-
-            logger.warning(
-                "Không tính được position size %s: %s",
-                ticker,
-                exc,
-            )
-
-    # ========================================================
-    # RESULT
-    # ========================================================
+        pos_info = calculate_position_size(
+            entry_price=res["technical"]["close"],
+            atr0=res["technical"]["atr14"],
+            nav=DEFAULT_NAV,
+            cash_available=DEFAULT_NAV,
+        )
 
     reply_text = format_check_result(
         res,
         pos_info,
     )
 
-    # ========================================================
-    # BUTTONS
-    # ========================================================
+    action_row = [
+        InlineKeyboardButton(
+            f"🔔 Nhận Alert {ticker}",
+            callback_data=f"cmd_alert_{ticker}",
+        ),
+        InlineKeyboardButton(
+            "📊 Backtest",
+            callback_data="cmd_backtest",
+        ),
+    ]
 
     keyboard = [
-        [
-            InlineKeyboardButton(
-                f"🔔 Nhận Alert {ticker}",
-                callback_data=f"cmd_alert_{ticker}",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "📊 VN30",
-                callback_data="cmd_vn30",
-            ),
-            InlineKeyboardButton(
-                "📈 VN100",
-                callback_data="cmd_vn100",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "🏭 Phân tích ngành",
-                callback_data="cmd_industries",
-            ),
-        ],
+        action_row
+    ]
+
+    keyboard.append(
         [
             InlineKeyboardButton(
                 "🔙 Menu Chính",
                 callback_data="cmd_start",
             )
-        ],
-    ]
+        ]
+    )
 
     await safe_edit_message(
         msg,
         reply_text,
         InlineKeyboardMarkup(keyboard),
     )
-
-    # ========================================================
-    # CHART
-    # ========================================================
 
     try:
 
@@ -1330,30 +1282,28 @@ async def do_check(
         await message.reply_photo(
             photo=chart_buf,
             caption=(
-                f"📈 Biểu đồ giá & "
-                f"chỉ báo kỹ thuật - {ticker}"
+                f"📈 Biểu đồ giá & chỉ báo "
+                f"kỹ thuật - {ticker}"
             ),
         )
 
     except Exception as e:
 
         logger.warning(
-            "Không thể tạo biểu đồ cho %s: %s",
-            ticker,
-            e,
+            f"Không thể tạo biểu đồ cho "
+            f"{ticker}: {e}"
         )
 
 
-# ============================================================
+# ==========================================
 # ALERT
-# ============================================================
+# ==========================================
 
 async def do_alert(
     message: Message,
     user_id: int,
     ticker: str = None,
 ):
-
     if not ticker:
 
         alerts = get_user_alerts(
@@ -1367,26 +1317,21 @@ async def do_alert(
             )
 
             await message.reply_html(
-                "🔔 <b>DANH SÁCH CẢNH BÁO</b>\n\n"
-                f"📌 Mã đang theo dõi:\n"
+                f"🔔 <b>Các mã bạn đang đăng ký "
+                f"nhận cảnh báo:</b> "
                 f"<code>{alert_str}</code>\n\n"
-                "Để thêm mã:\n"
-                "<code>/alert &lt;MÃ&gt;</code>\n\n"
-                "Ví dụ:\n"
-                "<code>/alert HPG</code>",
-                reply_markup=get_main_menu_keyboard(),
+                f"Để thêm mã mới, gõ: "
+                f"<code>/alert &lt;MÃ&gt;</code> "
+                f"(Ví dụ: <code>/alert HPG</code>)"
             )
 
         else:
 
             await message.reply_html(
-                "🔔 <b>CẢNH BÁO</b>\n\n"
-                "Bạn chưa đăng ký mã nào.\n\n"
-                "Để thêm mã:\n"
-                "<code>/alert &lt;MÃ&gt;</code>\n\n"
-                "Ví dụ:\n"
-                "<code>/alert HPG</code>",
-                reply_markup=get_main_menu_keyboard(),
+                "ℹ️ Bạn chưa đăng ký cảnh báo mã nào.\n"
+                "Gõ: <code>/alert &lt;MÃ&gt;</code> "
+                "để đăng ký "
+                "(Ví dụ: <code>/alert HPG</code>)"
             )
 
         return
@@ -1399,55 +1344,42 @@ async def do_alert(
     )
 
     await message.reply_html(
-        f"✅ <b>Đã đăng ký cảnh báo {ticker}</b>\n\n"
-        "Bot sẽ theo dõi tín hiệu theo "
-        "ngưỡng đã cấu hình.",
-        reply_markup=get_main_menu_keyboard(),
+        f"✅ <b>Đã đăng ký nhận cảnh báo "
+        f"cho mã {ticker}!</b>\n"
+        f"Hệ thống sẽ tự động quét và gửi tin nhắn "
+        f"cho bạn khi có tín hiệu."
     )
 
 
-# ============================================================
+# ==========================================
 # PORTFOLIO
-# ============================================================
+# ==========================================
 
 async def do_portfolio(
     message: Message,
 ):
-
     msg = (
-        "💼 <b>QUẢN TRỊ DANH MỤC & VỐN</b>\n\n"
-
-        f"💰 <b>NAV giả định:</b> "
+        "💼 <b>QUẢN TRỊ DANH MỤC & VỐN ĐẦU TƯ</b>\n\n"
+        f"💰 <b>Vốn NAV giả định:</b> "
         f"<code>{DEFAULT_NAV:,.0f} VNĐ</code>\n"
-
-        "🛡 <b>Rủi ro/lệnh:</b> "
-        "Tối đa 0.5% NAV\n"
-
-        "📊 <b>Phân bổ:</b> "
-        "Tối đa 20% NAV/mã\n"
-
-        "📦 <b>Số mã tối đa:</b> "
-        "5 mã\n"
-
-        "📉 <b>Stop Loss:</b> "
-        "Entry - 2×ATR\n"
-
-        "🎯 <b>Target:</b> "
-        "Entry + 3×ATR\n\n"
-
-        "<i>Chọn rổ cổ phiếu để tìm tín hiệu:</i>"
+        f"🛡 <b>Quy tắc rủi ro:</b> "
+        f"Tối đa 0.5% NAV/lệnh "
+        f"(~{DEFAULT_NAV * 0.005:,.0f} VNĐ)\n"
+        f"📊 <b>Phân bổ tối đa:</b> "
+        f"20% NAV/mã | Tối đa 5 mã\n"
+        f"📉 <b>Thoát lệnh:</b> "
+        f"Cắt lỗ Stop0 = Entry - 2*ATR, "
+        f"Chốt lời Target0 = Entry + 3*ATR\n\n"
+        "💡 Dùng <code>/backtest</code> "
+        "để kiểm định chiến lược."
     )
 
     keyboard = [
         [
             InlineKeyboardButton(
-                "📊 Quét VN30",
-                callback_data="cmd_vn30",
-            ),
-            InlineKeyboardButton(
-                "📈 Quét VN100",
-                callback_data="cmd_vn100",
-            ),
+                "📊 Backtest chiến lược",
+                callback_data="cmd_backtest",
+            )
         ],
         [
             InlineKeyboardButton(
@@ -1465,25 +1397,139 @@ async def do_portfolio(
     )
 
 
-# ============================================================
-# BACKTEST
-# ============================================================
+# ==========================================
+# BACKTEST - MENU
+# ==========================================
+
+async def do_backtest_menu(
+    message: Message,
+):
+    """
+    Menu chọn phạm vi backtest.
+
+    1. 5 mã tiêu biểu
+    2. VN30
+    3. Mã riêng
+    """
+
+    text = (
+        "📊 <b>BACKTEST CHIẾN LƯỢC</b>\n\n"
+        "Chọn phạm vi muốn kiểm định:\n\n"
+
+        "🧪 <b>5 mã tiêu biểu</b>\n"
+        "HPG • FPT • VNM • MWG • REE\n\n"
+
+        "📈 <b>VN30</b>\n"
+        "Kiểm định toàn bộ rổ VN30 hiện tại.\n\n"
+
+        "🔎 <b>Mã riêng</b>\n"
+        "Ví dụ:\n"
+        "<code>/backtest SSI</code>\n"
+        "<code>/backtest HPG FPT MWG</code>"
+    )
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "🧪 5 mã tiêu biểu",
+                callback_data="cmd_backtest_sample",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📈 Backtest VN30",
+                callback_data="cmd_backtest_vn30",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🔎 Backtest mã riêng",
+                callback_data="cmd_backtest_custom",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🔙 Menu Chính",
+                callback_data="cmd_start",
+            )
+        ],
+    ]
+
+    await message.reply_html(
+        text,
+        reply_markup=InlineKeyboardMarkup(
+            keyboard
+        ),
+    )
+
+
+# ==========================================
+# BACKTEST - CHẠY
+# ==========================================
 
 async def do_backtest(
     message: Message,
+    tickers=None,
+    universe_name="5 mã tiêu biểu",
+    lookback_days=BACKTEST_LOOKBACK_DAYS,
 ):
+    """
+    Chạy backtest theo danh sách ticker.
+
+    tickers=None:
+        dùng 5 mã mặc định.
+
+    Ví dụ:
+        ["HPG", "FPT"]
+        ["SSI"]
+        danh sách VN30
+    """
+
+    if tickers is None:
+
+        tickers = (
+            DEFAULT_BACKTEST_TICKERS.copy()
+        )
+
+    # Chuẩn hóa ticker
+    tickers = [
+        str(ticker).upper().strip()
+        for ticker in tickers
+        if str(ticker).strip()
+    ]
+
+    # Loại mã trùng
+    tickers = list(
+        dict.fromkeys(tickers)
+    )
+
+    if not tickers:
+
+        await message.reply_html(
+            "⚠️ Không có mã cổ phiếu nào "
+            "để chạy backtest."
+        )
+
+        return
+
+    ticker_count = len(tickers)
 
     msg = await message.reply_html(
         "⏳ <i>Đang chạy Backtest...</i>\n\n"
-        "📊 Kiểm thử chiến lược trên dữ liệu lịch sử.\n"
-        "Có thể mất khoảng 20-30 giây."
+        f"📌 Phạm vi: <b>{universe_name}</b>\n"
+        f"📊 Số mã: <b>{ticker_count}</b>\n"
+        f"⏱ Thời gian: "
+        f"<b>{lookback_days} phiên</b>\n\n"
+        "Có thể mất một lúc nếu chạy nhiều mã."
     )
 
     try:
 
         report = await asyncio.to_thread(
             run_portfolio_backtest,
-            lookback_days=120,
+            tickers=tickers,
+            lookback_days=lookback_days,
+            universe_name=universe_name,
         )
 
         reply_text = format_backtest_message(
@@ -1498,19 +1544,25 @@ async def do_backtest(
 
         reply_text = (
             "⚠️ <b>Không thể chạy Backtest.</b>\n\n"
-            f"<code>{exc}</code>"
+            f"<code>{str(exc)}</code>"
         )
 
     keyboard = [
         [
             InlineKeyboardButton(
-                "📊 Quét VN30",
-                callback_data="cmd_vn30",
+                "🧪 5 mã",
+                callback_data="cmd_backtest_sample",
             ),
             InlineKeyboardButton(
-                "📈 Quét VN100",
-                callback_data="cmd_vn100",
+                "📈 VN30",
+                callback_data="cmd_backtest_vn30",
             ),
+        ],
+        [
+            InlineKeyboardButton(
+                "🔎 Mã riêng",
+                callback_data="cmd_backtest_custom",
+            )
         ],
         [
             InlineKeyboardButton(
@@ -1523,23 +1575,30 @@ async def do_backtest(
     await safe_edit_message(
         msg,
         reply_text,
-        InlineKeyboardMarkup(
-            keyboard
-        ),
+        InlineKeyboardMarkup(keyboard),
     )
 
 
-# ============================================================
+# ==========================================
 # COMMAND HANDLERS
-# ============================================================
+# ==========================================
 
 async def start_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-
     await do_start(
         update.message
+    )
+
+
+async def signals_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    await do_signals(
+        update.message,
+        context.application,
     )
 
 
@@ -1547,7 +1606,6 @@ async def industries_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-
     await do_industries(
         update.message
     )
@@ -1557,7 +1615,6 @@ async def industry_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-
     if not context.args:
 
         await do_industries(
@@ -1576,19 +1633,18 @@ async def vn30_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-
     await do_vn30(
         update.message
     )
 
 
-async def vn100_command(
+async def filterstats_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-
-    await do_vn100(
-        update.message
+    await do_filterstats(
+        update.message,
+        context.application,
     )
 
 
@@ -1596,17 +1652,13 @@ async def check_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-
     if not context.args:
 
         await update.message.reply_html(
-            "🔎 <b>KIỂM TRA CỔ PHIẾU</b>\n\n"
-            "Vui lòng nhập mã cổ phiếu.\n\n"
-            "Ví dụ:\n"
-            "<code>/check HPG</code>\n"
-            "<code>/check FPT</code>\n"
-            "<code>/check VNM</code>",
-            reply_markup=get_check_menu_keyboard(),
+            "⚠️ <b>Vui lòng nhập mã cổ phiếu "
+            "cần tra cứu.</b>\n"
+            "Ví dụ: <code>/check HPG</code> "
+            "hoặc <code>/check FPT</code>"
         )
 
         return
@@ -1621,7 +1673,6 @@ async def alert_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-
     user_id = update.effective_user.id
 
     ticker = (
@@ -1641,47 +1692,199 @@ async def portfolio_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-
     await do_portfolio(
         update.message
     )
 
 
+# ==========================================
+# BACKTEST COMMAND
+# ==========================================
+
 async def backtest_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+    """
+    Cú pháp:
+
+    /backtest
+        -> mở menu
+
+    /backtest sample
+        -> 5 mã tiêu biểu
+
+    /backtest vn30
+        -> toàn bộ VN30
+
+    /backtest SSI
+        -> chỉ SSI
+
+    /backtest HPG FPT MWG
+        -> nhiều mã riêng
+    """
+
+    args = [
+        arg.upper().strip()
+        for arg in context.args
+        if arg.strip()
+    ]
+
+    # --------------------------------------
+    # /backtest
+    # --------------------------------------
+
+    if not args:
+
+        await do_backtest_menu(
+            update.message
+        )
+
+        return
+
+    # --------------------------------------
+    # /backtest sample
+    # --------------------------------------
+
+    if (
+        len(args) == 1
+        and args[0] in {
+            "SAMPLE",
+            "5MA",
+        }
+    ):
+
+        await do_backtest(
+            update.message,
+            tickers=(
+                DEFAULT_BACKTEST_TICKERS.copy()
+            ),
+            universe_name="5 mã tiêu biểu",
+        )
+
+        return
+
+    # --------------------------------------
+    # /backtest vn30
+    # --------------------------------------
+
+    if (
+        len(args) == 1
+        and args[0] == "VN30"
+    ):
+
+        loading = await update.message.reply_html(
+            "⏳ <i>Đang lấy danh sách VN30...</i>"
+        )
+
+        try:
+
+            tickers = await asyncio.to_thread(
+                fetch_vn30_tickers
+            )
+
+            if not tickers:
+
+                await safe_edit_message(
+                    loading,
+                    "⚠️ Không lấy được danh sách VN30.",
+                )
+
+                return
+
+            await safe_edit_message(
+                loading,
+                f"⏳ <i>Đã lấy {len(tickers)} mã VN30. "
+                f"Đang bắt đầu backtest...</i>",
+            )
+
+            await do_backtest(
+                update.message,
+                tickers=tickers,
+                universe_name="VN30",
+            )
+
+        except Exception as exc:
+
+            logger.exception(
+                "Lỗi lấy danh sách VN30 cho backtest"
+            )
+
+            await safe_edit_message(
+                loading,
+                "⚠️ <b>Lỗi backtest VN30:</b>\n"
+                f"<code>{str(exc)}</code>",
+            )
+
+        return
+
+    # --------------------------------------
+    # /backtest HPG
+    # /backtest HPG FPT MWG
+    # --------------------------------------
+
+    invalid = [
+        ticker
+        for ticker in args
+        if not re.fullmatch(
+            r"[A-Z]{2,5}",
+            ticker,
+        )
+    ]
+
+    if invalid:
+
+        await update.message.reply_html(
+            "⚠️ <b>Cú pháp không hợp lệ.</b>\n\n"
+            "Ví dụ:\n"
+            "<code>/backtest SSI</code>\n"
+            "<code>/backtest HPG FPT MWG</code>\n"
+            "<code>/backtest VN30</code>\n"
+            "<code>/backtest sample</code>"
+        )
+
+        return
+
+    # Đây là phần QUAN TRỌNG:
+    # truyền đúng args vào do_backtest
 
     await do_backtest(
-        update.message
+        update.message,
+        tickers=args,
+        universe_name=(
+            "Mã riêng: "
+            + ", ".join(args)
+        ),
     )
 
 
-# ============================================================
-# CALLBACK HANDLER
-# ============================================================
+# ==========================================
+# CALLBACK QUERY
+# ==========================================
 
 async def button_callback_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
+    """
+    Xử lý các nút Inline Keyboard.
+    """
 
     query = update.callback_query
 
     try:
         await query.answer()
+
     except Exception:
         pass
 
     data = query.data
-
     message = query.message
-
     user_id = query.from_user.id
 
-    # ========================================================
-    # START
-    # ========================================================
+    # --------------------------------------
+    # MENU CHÍNH
+    # --------------------------------------
 
     if data == "cmd_start":
 
@@ -1689,19 +1892,9 @@ async def button_callback_handler(
             message
         )
 
-    # ========================================================
-    # CHECK MENU
-    # ========================================================
-
-    elif data == "cmd_check_menu":
-
-        await do_check_menu(
-            message
-        )
-
-    # ========================================================
-    # INDUSTRIES
-    # ========================================================
+    # --------------------------------------
+    # NGÀNH
+    # --------------------------------------
 
     elif data == "cmd_industries":
 
@@ -1713,20 +1906,47 @@ async def button_callback_handler(
         "cmd_industry_"
     ):
 
-        industry_code = data.replace(
-            "cmd_industry_",
-            "",
-            1,
-        )
-
         await do_industry(
             message,
-            industry_code,
+            data.replace(
+                "cmd_industry_",
+                "",
+                1,
+            ),
         )
 
-    # ========================================================
+    # --------------------------------------
+    # SIGNALS
+    # --------------------------------------
+
+    elif data == "cmd_signals":
+
+        await do_signals(
+            message,
+            context.application,
+        )
+
+    elif data.startswith(
+        "cmd_signals_p"
+    ):
+
+        page = int(
+            data.replace(
+                "cmd_signals_p",
+                "",
+            )
+        )
+
+        await do_signals(
+            message,
+            context.application,
+            page=page,
+            edit_target=message,
+        )
+
+    # --------------------------------------
     # VN30
-    # ========================================================
+    # --------------------------------------
 
     elif data == "cmd_vn30":
 
@@ -1742,7 +1962,6 @@ async def button_callback_handler(
             data.replace(
                 "cmd_vn30_p",
                 "",
-                1,
             )
         )
 
@@ -1752,37 +1971,20 @@ async def button_callback_handler(
             edit_target=message,
         )
 
-    # ========================================================
-    # VN100
-    # ========================================================
+    # --------------------------------------
+    # FILTER STATS
+    # --------------------------------------
 
-    elif data == "cmd_vn100":
+    elif data == "cmd_filterstats":
 
-        await do_vn100(
-            message
-        )
-
-    elif data.startswith(
-        "cmd_vn100_p"
-    ):
-
-        page = int(
-            data.replace(
-                "cmd_vn100_p",
-                "",
-                1,
-            )
-        )
-
-        await do_vn100(
+        await do_filterstats(
             message,
-            page=page,
-            edit_target=message,
+            context.application,
         )
 
-    # ========================================================
+    # --------------------------------------
     # CHECK
-    # ========================================================
+    # --------------------------------------
 
     elif data.startswith(
         "cmd_check_"
@@ -1791,7 +1993,6 @@ async def button_callback_handler(
         ticker = data.replace(
             "cmd_check_",
             "",
-            1,
         )
 
         await do_check(
@@ -1799,16 +2000,9 @@ async def button_callback_handler(
             ticker,
         )
 
-    # ========================================================
+    # --------------------------------------
     # ALERT
-    # ========================================================
-
-    elif data == "cmd_my_alerts":
-
-        await do_alert(
-            message,
-            user_id,
-        )
+    # --------------------------------------
 
     elif data.startswith(
         "cmd_alert_"
@@ -1817,7 +2011,6 @@ async def button_callback_handler(
         ticker = data.replace(
             "cmd_alert_",
             "",
-            1,
         )
 
         await do_alert(
@@ -1826,9 +2019,9 @@ async def button_callback_handler(
             ticker,
         )
 
-    # ========================================================
+    # --------------------------------------
     # PORTFOLIO
-    # ========================================================
+    # --------------------------------------
 
     elif data == "cmd_portfolio":
 
@@ -1836,25 +2029,118 @@ async def button_callback_handler(
             message
         )
 
-    # ========================================================
+    # ======================================
     # BACKTEST
-    # ========================================================
+    # ======================================
 
     elif data == "cmd_backtest":
 
-        await do_backtest(
+        await do_backtest_menu(
             message
         )
 
+    # --------------------------------------
+    # BACKTEST SAMPLE
+    # --------------------------------------
 
-# ============================================================
+    elif data == "cmd_backtest_sample":
+
+        await do_backtest(
+            message,
+            tickers=(
+                DEFAULT_BACKTEST_TICKERS.copy()
+            ),
+            universe_name="5 mã tiêu biểu",
+        )
+
+    # --------------------------------------
+    # BACKTEST VN30
+    # --------------------------------------
+
+    elif data == "cmd_backtest_vn30":
+
+        loading = await message.reply_html(
+            "⏳ <i>Đang lấy danh sách VN30...</i>"
+        )
+
+        try:
+
+            tickers = await asyncio.to_thread(
+                fetch_vn30_tickers
+            )
+
+            if not tickers:
+
+                await safe_edit_message(
+                    loading,
+                    "⚠️ Không lấy được danh sách VN30.",
+                )
+
+                return
+
+            await safe_edit_message(
+                loading,
+                f"⏳ <i>Đã lấy {len(tickers)} mã VN30. "
+                f"Đang chạy backtest...</i>",
+            )
+
+            await do_backtest(
+                message,
+                tickers=tickers,
+                universe_name="VN30",
+            )
+
+        except Exception as exc:
+
+            logger.exception(
+                "Lỗi backtest VN30"
+            )
+
+            await safe_edit_message(
+                loading,
+                "⚠️ <b>Lỗi backtest VN30:</b>\n"
+                f"<code>{str(exc)}</code>",
+            )
+
+    # --------------------------------------
+    # BACKTEST CUSTOM
+    # --------------------------------------
+
+    elif data == "cmd_backtest_custom":
+
+        await safe_edit_message(
+            message,
+            "🔎 <b>BACKTEST MÃ RIÊNG</b>\n\n"
+            "Hãy nhập lệnh:\n\n"
+            "<code>/backtest SSI</code>\n\n"
+            "Hoặc nhiều mã:\n"
+            "<code>/backtest HPG FPT MWG</code>",
+        )
+
+    # --------------------------------------
+    # ALERT LIST
+    # --------------------------------------
+
+    elif data == "cmd_my_alerts":
+
+        await do_alert(
+            message,
+            user_id,
+            None,
+        )
+
+
+# ==========================================
 # ERROR HANDLER
-# ============================================================
+# ==========================================
 
 async def error_handler(
     update: object,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
+    """
+    Bắt mọi ngoại lệ.
+    """
 
     logger.error(
         "Exception while handling an update:",
@@ -1869,19 +2155,22 @@ async def error_handler(
         try:
 
             await update.effective_message.reply_text(
-                "⚠️ Có sự cố khi xử lý yêu cầu:\n"
-                f"{context.error}"
+                f"⚠️ Có sự cố định dạng "
+                f"hoặc dữ liệu: {context.error}"
             )
 
         except Exception:
             pass
 
 
-# ============================================================
+# ==========================================
 # BUILD APPLICATION
-# ============================================================
+# ==========================================
 
 def build_application():
+    """
+    Khởi tạo Telegram Application.
+    """
 
     if (
         not TELEGRAM_BOT_TOKEN
@@ -1903,21 +2192,33 @@ def build_application():
 
     app = (
         ApplicationBuilder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .request(request)
-        .concurrent_updates(True)
-        .post_init(set_bot_commands)
+        .token(
+            TELEGRAM_BOT_TOKEN
+        )
+        .request(
+            request
+        )
+        .concurrent_updates(
+            True
+        )
         .build()
     )
 
-    # ========================================================
+    # ======================================
     # COMMANDS
-    # ========================================================
+    # ======================================
 
     app.add_handler(
         CommandHandler(
             "start",
             start_command,
+        )
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "signals",
+            signals_command,
         )
     )
 
@@ -1944,8 +2245,8 @@ def build_application():
 
     app.add_handler(
         CommandHandler(
-            "vn100",
-            vn100_command,
+            "filterstats",
+            filterstats_command,
         )
     )
 
@@ -1970,6 +2271,7 @@ def build_application():
         )
     )
 
+    # BACKTEST
     app.add_handler(
         CommandHandler(
             "backtest",
@@ -1977,9 +2279,9 @@ def build_application():
         )
     )
 
-    # ========================================================
+    # ======================================
     # CALLBACK
-    # ========================================================
+    # ======================================
 
     app.add_handler(
         CallbackQueryHandler(
@@ -1987,27 +2289,12 @@ def build_application():
         )
     )
 
-    # ========================================================
-    # ERROR
-    # ========================================================
+    # ======================================
+    # ERROR HANDLER
+    # ======================================
 
     app.add_error_handler(
         error_handler
     )
-
-    # ========================================================
-    # MVP SCOPE
-    #
-    # GIỮ:
-    # /vn30
-    # /vn100
-    # /check
-    # /industry
-    # /portfolio
-    # /alert
-    # /backtest
-    #
-    # KHÔNG ĐƯA /signals VÀ /filterstats VÀO MENU.
-    # ========================================================
 
     return app

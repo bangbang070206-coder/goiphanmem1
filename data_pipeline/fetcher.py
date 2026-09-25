@@ -36,7 +36,6 @@ from vnstock import Listing
 # VNSTOCK CONFIG
 # ============================================================
 
-# Tắt telemetry của vnstock để giảm thông báo không cần thiết.
 os.environ["VNSTOCK_TELEMETRY"] = "off"
 
 logger = logging.getLogger(__name__)
@@ -46,20 +45,17 @@ logger = logging.getLogger(__name__)
 # CACHE
 # ============================================================
 
-# Cache danh sách mã niêm yết theo sàn.
 _LISTING_CACHE = {}
 
 LISTING_CACHE_TTL_HOURS = 12
 
 
-# Cache phân loại ngành.
 _INDUSTRY_CACHE = {
     "data": None,
     "fetched_at": None,
 }
 
 
-# Cache VN30.
 _VN30_CACHE = {
     "data": None,
     "fetched_at": None,
@@ -207,7 +203,6 @@ def fetch_all_listed_tickers(
             )
             return []
 
-        # vnstock hiện tại dùng "symbol".
         if "symbol" not in df.columns:
             logger.warning(
                 "Listing thiếu cột 'symbol'. "
@@ -242,7 +237,6 @@ def fetch_all_listed_tickers(
             .tolist()
         )
 
-        # Remove duplicates.
         tickers = list(
             dict.fromkeys(tickers)
         )
@@ -256,7 +250,6 @@ def fetch_all_listed_tickers(
             )
             return []
 
-        # Cache.
         _LISTING_CACHE[
             exchange_key
         ] = tickers
@@ -374,14 +367,18 @@ def fetch_stock_quote_history(
     Thu thập dữ liệu OHLCV.
 
     Ưu tiên:
-        1. SQLite cache
-        2. vnstock API
+        1. SQLite cache nếu cache đủ và còn mới.
+        2. vnstock API nếu cache đã cũ hoặc thiếu dữ liệu.
 
     Nếu API lỗi:
         trả dữ liệu cache hiện có.
     """
 
-    ticker = ticker.upper()
+    ticker = ticker.upper().strip()
+
+    # --------------------------------------------------------
+    # LẤY CACHE
+    # --------------------------------------------------------
 
     df_cached = get_price_history(
         ticker,
@@ -396,14 +393,67 @@ def fetch_stock_quote_history(
     )
 
     # --------------------------------------------------------
-    # CACHE ĐỦ DỮ LIỆU
+    # KIỂM TRA CACHE
     # --------------------------------------------------------
 
     if (
         not df_cached.empty
         and len(df_cached) >= required_sessions
     ):
-        return df_cached
+
+        try:
+
+            cached_dates = pd.to_datetime(
+                df_cached["date"],
+                errors="coerce",
+            ).dropna()
+
+            if not cached_dates.empty:
+
+                latest_cached_date = (
+                    cached_dates.max().date()
+                )
+
+                today = datetime.now().date()
+
+                # ------------------------------------------------
+                # CACHE ĐÃ CÓ DỮ LIỆU HÔM NAY
+                # ------------------------------------------------
+
+                if latest_cached_date >= today:
+
+                    logger.info(
+                        "%s: dùng cache mới nhất %s.",
+                        ticker,
+                        latest_cached_date,
+                    )
+
+                    return df_cached
+
+                # ------------------------------------------------
+                # CACHE ĐÃ CŨ
+                # ------------------------------------------------
+
+                logger.info(
+                    "%s: cache mới nhất %s, "
+                    "hiện tại %s. "
+                    "Đang cập nhật từ vnstock...",
+                    ticker,
+                    latest_cached_date,
+                    today,
+                )
+
+                # Không return.
+                # Tiếp tục xuống phần API.
+
+        except Exception as exc:
+
+            logger.warning(
+                "%s: Không kiểm tra được ngày cache: %s. "
+                "Sẽ thử gọi API.",
+                ticker,
+                exc,
+            )
 
     # --------------------------------------------------------
     # API
@@ -451,7 +501,10 @@ def fetch_stock_quote_history(
             BaseException,
         ):
 
-            # Fallback API cũ.
+            # ------------------------------------------------
+            # FALLBACK API CŨ
+            # ------------------------------------------------
+
             from vnstock import Vnstock
 
             throttle()
@@ -467,7 +520,7 @@ def fetch_stock_quote_history(
             )
 
         # ----------------------------------------------------
-        # SAVE
+        # SAVE DATA
         # ----------------------------------------------------
 
         if df is not None and not df.empty:
@@ -487,15 +540,27 @@ def fetch_stock_quote_history(
                     .str[:10]
                 )
 
+                # Lưu dữ liệu mới vào SQLite.
                 save_price_history(
                     ticker,
                     df,
                 )
 
-                return get_price_history(
+                # Đọc lại database.
+                df_updated = get_price_history(
                     ticker,
                     limit=days,
                 )
+
+                if (
+                    df_updated is not None
+                    and not df_updated.empty
+                ):
+                    return df_updated
+
+                # Nếu database không trả lại được,
+                # dùng trực tiếp dữ liệu API.
+                return df
 
     except (
         Exception,
@@ -509,6 +574,10 @@ def fetch_stock_quote_history(
             ticker,
             exc,
         )
+
+    # --------------------------------------------------------
+    # FALLBACK CACHE
+    # --------------------------------------------------------
 
     return df_cached
 
@@ -771,12 +840,11 @@ def fetch_stock_financials(
         # ====================================================
         # P/E + P/B
         # ====================================================
-        #
+
         # Strategy 3.0 hiện tại không dùng P/E/P/B.
         #
         # Vì ratio() đang có vấn đề dữ liệu cũ,
         # KHÔNG lấy P/E/P/B từ ratio() nữa.
-        #
 
         fin_metrics["pe"] = None
         fin_metrics["pb"] = None
